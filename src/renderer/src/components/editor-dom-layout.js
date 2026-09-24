@@ -45,7 +45,10 @@ const readRenderedColumnWidths = (table) => {
 
 const applyColumnGroupWidths = (table, widths) => {
   const wrapper = table.closest('.table-wrapper')
-  const scrollLeft = wrapper?.scrollLeft ?? 0
+  const pendingScrollLeft = wrapper?.__horsemdTableScrollLeft
+  const scrollLeft = Number.isFinite(pendingScrollLeft)
+    ? pendingScrollLeft
+    : wrapper?.scrollLeft ?? 0
   let colgroup = table.querySelector('colgroup.hm-column-widths')
   if (!colgroup) {
     colgroup = document.createElement('colgroup')
@@ -124,7 +127,7 @@ const getColumnResizeAtPointer = (view, event, side) => {
 // the default TableView, so its native live-resize path has no persistent
 // colgroup to update. Keeping the final transaction here lets the preview stay
 // DOM-only while retaining the standard data-colwidth document format.
-const persistColumnWidth = (view, resize, width) => {
+const persistColumnWidth = (view, resize, width, beforeDispatch = null) => {
   const $cell = view.state.doc.resolve(resize.cellPos)
   const table = $cell.node(-1)
   const map = TableMap.get(table)
@@ -144,6 +147,7 @@ const persistColumnWidth = (view, resize, width) => {
     tr.setNodeMarkup(tableStart + pos, null, { ...attrs, colwidth })
   }
   if (!tr.docChanged) return false
+  if (typeof beforeDispatch === 'function') beforeDispatch()
   view.dispatch(tr)
   return true
 }
@@ -258,13 +262,14 @@ const mountSlashMenuBounds = ({ host, scrollEl, cleanups }) => {
   })
 }
 
-const mountTableHandleBounds = ({ view, host, scrollEl, cleanups, markUserEdit }) => {
+const mountTableHandleBounds = ({ view, host, scrollEl, cleanups, markUserEdit, onRichEditPending }) => {
   if (!scrollEl) return
   const margin = 8
   const resizeHoldMs = 220
   const resizeMoveTolerance = 8
   let raf = 0
   let resizeIntent = null
+  let tableControlScrollGuard = null
   let needsColumnWidthSync = true
 
   const setTranslate = (element, x, y) => {
@@ -387,7 +392,10 @@ const mountTableHandleBounds = ({ view, host, scrollEl, cleanups, markUserEdit }
         left: Math.max(safe.left, (blockRect?.left ?? safe.left) + margin),
         right: Math.min(safe.right, (blockRect?.right ?? safe.right) - margin)
       }
-      if (horizontalSafe.right <= horizontalSafe.left) return
+      const handleHorizontalSafe = handle.dataset.role === 'row-drag-handle'
+        ? safe
+        : horizontalSafe
+      if (handleHorizontalSafe.right <= handleHorizontalSafe.left) return
 
       let handleRect = handle.getBoundingClientRect()
       const [previousShiftX, previousShiftY] = getTranslate(handle)
@@ -422,15 +430,38 @@ const mountTableHandleBounds = ({ view, host, scrollEl, cleanups, markUserEdit }
         setTranslate(handle, shiftX, shiftY)
         handleRect = handle.getBoundingClientRect()
       } else {
-        const handleSafeLeft = Math.max(horizontalSafe.left, (wrapperRect?.left ?? horizontalSafe.left) + 2)
-        const handleSafeRight = Math.min(horizontalSafe.right, wrapperRect?.right ?? horizontalSafe.right)
+        // Keep the row handle in the editor gutter instead of over the first
+        // table column. Crepe's `placement: left` puts half of the handle over
+        // the row boundary; the old wrapper-based clamp then moved the whole
+        // control into the table. Prefer the narrow external strip immediately
+        // left of the wrapper, but fall back to the viewport when a narrow
+        // window leaves no room for that strip.
+        const wrapperLeft = wrapperRect?.left
+        const externalRight = Number.isFinite(wrapperLeft)
+          ? wrapperLeft - margin
+          : horizontalSafe.right
+        const externalLeft = externalRight - handleRect.width
+        const hasExternalSpace = externalLeft >= handleHorizontalSafe.left
+        const handleSafeLeft = hasExternalSpace ? externalLeft : handleHorizontalSafe.left
+        const handleSafeRight = hasExternalSpace ? externalRight : handleHorizontalSafe.right
         const shiftX = fitShift(rawRect.left, rawRect.right, handleSafeLeft, handleSafeRight)
         setTranslate(handle, shiftX, 0)
         handleRect = handle.getBoundingClientRect()
       }
 
       if (!group || group.dataset.show !== 'true' || group.offsetParent === null) return
-      const menuHorizontalSafe = block?.classList.contains('hm-table-controls-open') ? safe : horizontalSafe
+      let menuHorizontalSafe = block?.classList.contains('hm-table-controls-open') ? safe : handleHorizontalSafe
+      if (handle.dataset.role === 'row-drag-handle' && wrapperRect) {
+        // Keep the row action menu beside the row handle as well. Without this
+        // separate interval, the menu's general viewport clamp can move it back
+        // over the first column when the delete action is shown.
+        const externalRight = wrapperRect.left - margin
+        const externalLeft = externalRight - group.offsetWidth
+        const viewportSafe = menuHorizontalSafe
+        if (externalLeft >= viewportSafe.left) {
+          menuHorizontalSafe = { left: externalLeft, right: externalRight }
+        }
+      }
       const groupHeight = group.offsetHeight
       const verticalSafe = block?.classList.contains('hm-table-controls-open')
         ? { top: safe.top, bottom: safe.bottom }
@@ -475,6 +506,123 @@ const mountTableHandleBounds = ({ view, host, scrollEl, cleanups, markUserEdit }
     if (raf) return
     raf = requestAnimationFrame(fix)
   }
+
+  // Selecting a column, clicking one of its floating actions, or clicking a
+  // cell can update the table node view. The new `.table-wrapper` starts at
+  // scrollLeft=0 even when the old wrapper was at the far right, which makes
+  // the interaction appear to jump the table back to its first columns.
+  // Capture the table's ordinal
+  // before Milkdown handles pointerdown. The scroll listener below restores the
+  // position synchronously when the browser performs its automatic selection
+  // scroll, while the following layout frames cover a wrapper replacement.
+  const getTableWrapper = (tableIndex) =>
+    host.querySelectorAll('.milkdown-table-block')[tableIndex]?.querySelector('.table-wrapper')
+
+  const restoreTableControlScroll = (guard) => {
+    const wrapper = getTableWrapper(guard.tableIndex)
+    if (!wrapper) return
+    wrapper.__horsemdTableScrollLeft = guard.scrollLeft
+    wrapper.scrollLeft = Math.min(
+      guard.scrollLeft,
+      Math.max(0, wrapper.scrollWidth - wrapper.clientWidth)
+    )
+  }
+
+  // ProseMirror's selection transaction can call scrollToSelection directly,
+  // before a browser scroll event is emitted. Intercept that path while a table
+  // control click is active, otherwise the scroll listener below is too late to
+  // prevent a one-frame flash at scrollLeft=0.
+  const previousHandleScrollToSelection = view.props.handleScrollToSelection
+  const handleTableScrollToSelection = (currentView) => {
+    const guard = currentView.dom.__horsemdTableScrollGuard
+    if (!guard) return typeof previousHandleScrollToSelection === 'function'
+      ? previousHandleScrollToSelection(currentView)
+      : false
+    restoreTableControlScroll(guard)
+    return true
+  }
+  view.setProps({ handleScrollToSelection: handleTableScrollToSelection })
+  const originalScrollToSelection = view.scrollToSelection
+  view.scrollToSelection = function horsemdScrollToSelection() {
+    const guard = this.dom.__horsemdTableScrollGuard
+    if (guard) {
+      restoreTableControlScroll(guard)
+      return
+    }
+    return originalScrollToSelection.call(this)
+  }
+
+  const preserveTableControlScroll = (event) => {
+    const documentAction = event.target.closest?.(
+      '.milkdown-table-block .button-group button, ' +
+      '.milkdown-table-block .line-handle .add-button'
+    )
+    if (documentAction && host.contains(documentAction)) {
+      if (Array.isArray(globalThis.__hmTableActionTrace)) {
+        globalThis.__hmTableActionTrace.push({
+          type: event.type,
+          className: documentAction.className || '',
+          tagName: documentAction.tagName || ''
+        })
+      }
+      // TableBlock stops pointerdown propagation on its internal handles, so
+      // the editor-root edit-intent listener cannot see these structural
+      // commands. Mark the real action here before Milkdown dispatches the
+      // delete/align/add transaction, otherwise rich DOM and authored source
+      // diverge without a dirty state or a save entry point.
+      markUserEdit()
+      onRichEditPending?.()
+    }
+
+    const interaction = event.target.closest?.(
+      '.milkdown-table-block .cell-handle, .milkdown-table-block .line-handle, ' +
+      '.milkdown-table-block th, .milkdown-table-block td'
+    )
+    if (!interaction || !host.contains(interaction)) return
+    const block = interaction.closest('.milkdown-table-block')
+    const wrapper = block?.querySelector('.table-wrapper')
+    if (!block || !wrapper) return
+    const tableIndex = [...host.querySelectorAll('.milkdown-table-block')].indexOf(block)
+    const scrollLeft = wrapper.scrollLeft
+    if (tableIndex < 0 || !Number.isFinite(scrollLeft)) return
+
+    const guard = { tableIndex, scrollLeft, frames: 0 }
+    tableControlScrollGuard = guard
+    view.dom.__horsemdTableScrollGuard = guard
+    let frames = 0
+    const restoreAcrossLayout = () => {
+      if (tableControlScrollGuard !== guard) return
+      restoreTableControlScroll(guard)
+      frames += 1
+      guard.frames = frames
+      if (frames < 16) requestAnimationFrame(restoreAcrossLayout)
+      else if (tableControlScrollGuard === guard) {
+        tableControlScrollGuard = null
+        if (view.dom.__horsemdTableScrollGuard === guard) {
+          delete view.dom.__horsemdTableScrollGuard
+        }
+        const wrapper = getTableWrapper(guard.tableIndex)
+        if (wrapper?.__horsemdTableScrollLeft === guard.scrollLeft) {
+          delete wrapper.__horsemdTableScrollLeft
+        }
+      }
+    }
+    requestAnimationFrame(restoreAcrossLayout)
+  }
+
+  const onTableScroll = (event) => {
+    if (
+      tableControlScrollGuard &&
+      event.target?.matches?.('.table-wrapper')
+    ) {
+      // This runs during the native scroll event, before the next paint. Do not
+      // wait for requestAnimationFrame: the user must never see the temporary
+      // scrollLeft=0 produced by ProseMirror's selection transaction.
+      restoreTableControlScroll(tableControlScrollGuard)
+    }
+    schedule()
+  }
+
   const onTablePointer = (event) => {
     if (event.target.closest?.('.milkdown-table-block')) schedule()
   }
@@ -562,10 +710,11 @@ const mountTableHandleBounds = ({ view, host, scrollEl, cleanups, markUserEdit }
         finished.table.dataset.hmColumnPreview = ''
         removeResizeGuide(finished)
         // The layout binding intercepts this boundary press before the editor's
-        // normal pointer-intent listener sees it, so mark it explicitly before
-        // dispatching the document transaction.
-        const changed = persistColumnWidth(view, finished.resize, finished.currentWidth)
-        if (changed) markUserEdit()
+        // normal pointer-intent listener sees it. `persistColumnWidth` invokes
+        // markUserEdit only after it has built a real docChanged transaction,
+        // but still before dispatch, so a no-op hold cannot leave false dirty
+        // state and a real resize is captured by SourceSyncTransactionJournal.
+        persistColumnWidth(view, finished.resize, finished.currentWidth, markUserEdit)
         requestAnimationFrame(() => requestAnimationFrame(() => {
           schedule({ syncColumnWidths: true })
         }))
@@ -602,6 +751,15 @@ const mountTableHandleBounds = ({ view, host, scrollEl, cleanups, markUserEdit }
       mutation.attributeName === 'data-colwidth' ||
       mutation.attributeName === 'colspan'
     ))
+    if (tableControlScrollGuard) {
+      const guardedWrapper = getTableWrapper(tableControlScrollGuard.tableIndex)
+      if (guardedWrapper) guardedWrapper.__horsemdTableScrollLeft = tableControlScrollGuard.scrollLeft
+      if (syncColumnWidths) {
+        syncRenderedTableColumnWidths(host)
+        needsColumnWidthSync = false
+      }
+      restoreTableControlScroll(tableControlScrollGuard)
+    }
     schedule({ syncColumnWidths })
   })
   observer.observe(host, {
@@ -611,9 +769,13 @@ const mountTableHandleBounds = ({ view, host, scrollEl, cleanups, markUserEdit }
     attributeFilter: ['data-show', 'data-colwidth', 'colspan']
   })
   host.addEventListener('pointermove', onTablePointer, { passive: true })
+  host.addEventListener('pointerdown', preserveTableControlScroll, true)
+  host.addEventListener('click', preserveTableControlScroll, true)
   host.addEventListener('click', onTablePointer, true)
+  host.addEventListener('mousedown', preserveTableControlScroll, true)
   host.addEventListener('mousedown', onColumnResizeMouseDown, true)
-  host.addEventListener('scroll', schedule, true)
+  host.addEventListener('scroll', onTableScroll, true)
+
   document.addEventListener('selectionchange', schedule)
   window.addEventListener('resize', schedule)
   schedule()
@@ -626,22 +788,37 @@ const mountTableHandleBounds = ({ view, host, scrollEl, cleanups, markUserEdit }
       removeResizeGuide(intent)
     }
     observer.disconnect()
+    if (tableControlScrollGuard) {
+      if (view.dom.__horsemdTableScrollGuard === tableControlScrollGuard) {
+        delete view.dom.__horsemdTableScrollGuard
+      }
+      const wrapper = getTableWrapper(tableControlScrollGuard.tableIndex)
+      if (wrapper?.__horsemdTableScrollLeft === tableControlScrollGuard.scrollLeft) {
+        delete wrapper.__horsemdTableScrollLeft
+      }
+      tableControlScrollGuard = null
+    }
+    view.setProps({ handleScrollToSelection: previousHandleScrollToSelection })
+    view.scrollToSelection = originalScrollToSelection
     host.querySelectorAll('.hm-table-controls-open').forEach((block) => {
       block.classList.remove('hm-table-controls-open')
     })
     host.removeEventListener('pointermove', onTablePointer)
+    host.removeEventListener('pointerdown', preserveTableControlScroll, true)
+    host.removeEventListener('click', preserveTableControlScroll, true)
     host.removeEventListener('click', onTablePointer, true)
+    host.removeEventListener('mousedown', preserveTableControlScroll, true)
     host.removeEventListener('mousedown', onColumnResizeMouseDown, true)
-    host.removeEventListener('scroll', schedule, true)
+    host.removeEventListener('scroll', onTableScroll, true)
     document.removeEventListener('selectionchange', schedule)
     window.removeEventListener('resize', schedule)
   })
 }
 
-export function mountEditorLayoutBindings({ view, host, cleanups, markUserEdit, reportActiveBlock }) {
+export function mountEditorLayoutBindings({ view, host, cleanups, markUserEdit, onRichEditPending, reportActiveBlock }) {
   const scrollEl = host.closest('.editor-scroll')
   mountSlashMenuBounds({ host, scrollEl, cleanups })
-  mountTableHandleBounds({ view, host, scrollEl, cleanups, markUserEdit })
+  mountTableHandleBounds({ view, host, scrollEl, cleanups, markUserEdit, onRichEditPending })
   mountTableActionMenuRetention({ host, cleanups })
 
   const onBlankAreaMouseDown = (event) => {

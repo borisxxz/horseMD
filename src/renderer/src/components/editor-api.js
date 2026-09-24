@@ -1,5 +1,5 @@
 import { TextSelection, NodeSelection } from '@milkdown/prose/state'
-import { commandsCtx, remarkCtx, serializerCtx } from '@milkdown/kit/core'
+import { commandsCtx, parserCtx, remarkCtx, serializerCtx } from '@milkdown/kit/core'
 import { toggleMark } from '@milkdown/prose/commands'
 import { replaceAll } from '@milkdown/utils'
 import { applyReviewMarkupInView } from './editor-review.js'
@@ -10,6 +10,7 @@ import {
   preserveRichMarkdownSource
 } from '../markdown-source-preservation.js'
 import { normalizeDisplayMath } from './editor-math.js'
+import { chooseCodeBlockMountMode } from './editor-codeblock-eager.js'
 import { markdownOffsetToPmPos, pmPosToMarkdownOffset } from './editor-source-map.js'
 import { createPdfSourceFromEditor } from './editor-pdf-content.js'
 import { applyHighlightInView, toggleHighlightCommand } from './editor-highlight.js'
@@ -22,6 +23,9 @@ import {
 import { strikethroughSchema } from '@milkdown/kit/preset/gfm'
 import { toggleLinkCommand } from '@milkdown/kit/component/link-tooltip'
 import { settleEditorMarkdown } from '../lib/editor-flush-settle.js'
+import { publishPendingSourceSyncJournalForFlush } from '../lib/source-sync/flush-journal.js'
+import { retiredLegacySourceSyncFailureReason } from '../lib/source-sync/legacy-owner.js'
+import { reconcileUnchangedSourceResult } from '../lib/source-sync/unchanged-source-result.js'
 
 export function createEditorApi({
   viewRef,
@@ -30,6 +34,7 @@ export function createEditorApi({
   lastMarkdownRef,
   canonicalMarkdownRef,
   programmaticReplaceRef,
+  serializerStyleHolder,
   hasPendingRichFlush,
   clearPendingRichFlush,
   generatedScratchRef,
@@ -40,7 +45,11 @@ export function createEditorApi({
   onStructureChange,
   isDestroyed,
   getT,
-  notify
+  notify,
+  validateSourceCandidate,
+  publishSourceSyncResult,
+  publishPendingTransactionJournal,
+  reportSourceSyncFailure
 }) {
   const getPdfSource = async () => {
     const v = viewRef.current
@@ -150,7 +159,15 @@ export function createEditorApi({
         generatedScratchRef.current = false
       }
       const next = normalizeReviewMarkupMarkdown(normalizeDisplayMath(source))
+      // Re-choose the code-block mount mode for the incoming document: pasting
+      // a block-heavy document into a small one must not eager-mount hundreds
+      // of CodeMirror instances (issue #126).
+      chooseCodeBlockMountMode(next)
       lastMarkdownRef.current = source
+      // Source mode just handed us freshly authored bytes: the serializer's
+      // list style must follow THIS spelling, or the next rich edit would
+      // diverge from it again (P7).
+      serializerStyleHolder?.setFrom?.(source)
       clearPendingRichFlush?.()
       if (programmaticReplaceRef) programmaticReplaceRef.current = programmaticReplace
       crepe.editor.action(replaceAll(next))
@@ -184,35 +201,222 @@ export function createEditorApi({
       // delayed markdownUpdated callback. Serialize the current ProseMirror
       // document instead of reading Crepe's potentially stale cached snapshot.
       const canonical = canonicalForSource(serializeCurrentDocument())
+      // A pending transaction journal owns the live PM revision even when the
+      // serialized Markdown is byte-identical to the committed canonical. This
+      // is required for editor-only metadata such as table column widths: GFM
+      // has no source syntax for `colwidth`, but Coordinator still must advance
+      // its expectedDoc checkpoint before committed-baseline validation runs.
+      const ownedTransaction = publishPendingSourceSyncJournalForFlush({
+        generatedScratch: generatedScratchRef?.current === true,
+        publishPendingTransactionJournal,
+        canonical,
+        expectedDoc: viewRef.current?.state.doc
+      })
+      if (ownedTransaction?.ok) {
+        clearPendingRichFlush?.()
+        return ownedTransaction.markdown
+      }
+      const retiredLegacyFailure = retiredLegacySourceSyncFailureReason(ownedTransaction)
+      if (retiredLegacyFailure) {
+        reportSourceSyncFailure?.(retiredLegacyFailure)
+        return null
+      }
       if (canonical === canonicalMarkdownRef.current) {
+        // A cached canonical snapshot is not proof that the authored source is
+        // still equivalent: an earlier callback may have advanced the baseline
+        // after a bad localized mapping. Source-mode switches and saves must
+        // validate even this fast path, or they can silently expose/write stale
+        // Markdown while the live ProseMirror document is different.
+        const committedIntegrity = validateSourceCandidate?.(
+          lastMarkdownRef.current,
+          viewRef.current?.state.doc,
+          canonical,
+          lastMarkdownRef.current,
+          'committed-source-baseline'
+        )
+        if (committedIntegrity && committedIntegrity.ok === false) {
+          reportSourceSyncFailure?.(committedIntegrity.reason || 'source-document-mismatch')
+          return null
+        }
         clearPendingRichFlush?.()
         return lastMarkdownRef.current
       }
-      const preserved = generatedScratchRef?.current
-        ? {
-            markdown: getGeneratedScratchMarkdown?.(canonical) || preserveGeneratedBulletMarkers(
-              lastMarkdownRef.current,
-              generatedScratchMarkdown(canonical)
-            ),
-            preserved: true,
-            reason: 'generated-scratch-flush'
-          }
-        : preserveRichMarkdownSource(
-            lastMarkdownRef.current,
-            canonicalMarkdownRef.current,
-            canonical
-          )
+      let preserved
+      if (generatedScratchRef?.current) {
+        // Keep flush behavior aligned with markdownUpdated. A source-mode/save
+        // flush can run before Milkdown publishes the delayed callback; if that
+        // live transaction just removed an empty list row, the local mapper is
+        // the only proof that canonical's trailing list-item paragraph is an
+        // editor-owned transient. Never grant this shortcut to other local
+        // reasons: generated scratch remains authoritative otherwise.
+        const localPreservation = preserveRichMarkdownSource(
+          lastMarkdownRef.current,
+          canonicalMarkdownRef.current,
+          canonical
+        )
+        const provenGeneratedTransient = localPreservation?.preserved !== false && (
+          localPreservation?.reason === 'empty-list-item-removed' ||
+          localPreservation?.reason === 'nested-empty-list-item-removed' ||
+          localPreservation?.reason === 'empty-list-item-merged-after-nested-list' ||
+          localPreservation?.reason === 'empty-ordered-item-merged-before-nested-list' ||
+          localPreservation?.reason === 'trailing-list-item-paragraph-emptied' ||
+          localPreservation?.reason === 'empty-task-item-merged-to-continuation' ||
+          localPreservation?.reason === 'trailing-empty-blockquote-paragraph-created'
+        )
+        preserved = provenGeneratedTransient
+          ? localPreservation
+          : {
+              markdown: getGeneratedScratchMarkdown?.(canonical) || preserveGeneratedBulletMarkers(
+                lastMarkdownRef.current,
+                generatedScratchMarkdown(canonical)
+              ),
+              preserved: true,
+              reason: 'generated-scratch-flush'
+            }
+      } else {
+        preserved = preserveRichMarkdownSource(
+          lastMarkdownRef.current,
+          canonicalMarkdownRef.current,
+          canonical
+        )
+      }
+      preserved = reconcileUnchangedSourceResult({
+        result: preserved,
+        source: lastMarkdownRef.current,
+        canonical,
+        expectedDoc: viewRef.current?.state.doc,
+        parseMarkdown: (value) => crepe.editor.ctx.get(parserCtx)(value)
+      })
+      if (Array.isArray(globalThis.__hmFlushTrace)) {
+        globalThis.__hmFlushTrace.push({
+          phase: 'flush-result',
+          force,
+          canonicalChanged: canonical !== canonicalMarkdownRef.current,
+          preserved: preserved?.preserved !== false,
+          reason: preserved?.reason || null
+        })
+        if (globalThis.__hmFlushTrace.length > 100) globalThis.__hmFlushTrace.shift()
+      }
       // Ambiguous mapping is an explicit failed transaction, not a committed
       // snapshot. Keep both the authored source and canonical baseline intact,
       // and leave the pending flag raised so a later callback/flush can retry
       // the cumulative delta. Returning null prevents source mode or save from
       // presenting the stale authored bytes as if the visible edit had synced.
-      if (preserved.preserved === false) return null
+      if (preserved.preserved === false) {
+        // STRUCTURAL (E0, 0.13.191 trace 05:23): a failure whose candidate IS
+        // the current source introduces no byte change — warning here reported
+        // a divergence the candidate itself proves was not introduced (the
+        // markdownUpdated loop holds the same shape silently). Keep the flush
+        // failed (return null) so stale bytes are never presented as synced;
+        // only the warning is suppressed, exactly like the callback path.
+        if (preserved.markdown !== lastMarkdownRef.current) {
+          reportSourceSyncFailure?.(preserved.reason || 'unmapped-source-change')
+        }
+        return null
+      }
+      if (typeof publishSourceSyncResult === 'function') {
+        let coordinated = publishSourceSyncResult({
+          result: preserved,
+          canonical,
+          expectedDoc: viewRef.current?.state.doc,
+          validationSite: 'editor-api-flush',
+          notifyChange: false,
+          boundary: 'forced-flush'
+        })
+        if (!coordinated?.ok && generatedScratchRef?.current) {
+          // STRUCTURAL (E0, 0.13.176 trace 04:32): in a generated scratch
+          // document the source bytes are editor-derived — there is no
+          // authored file to protect. When a trusted local-mapper result
+          // fails validation, retry once with the serializer canonical
+          // (still validated by the coordinator) instead of pausing sync
+          // with a sticky warning. Existing files keep fail-closed.
+          // Marker-friendly first, raw canonical as the guaranteed floor:
+          // 1) try preserving the user's typed bullet spelling (`-`/`+`) on
+          //    top of the canonical — keeps scratch docs interoperable with
+          //    other Markdown tools that diff on marker spelling;
+          // 2) if that transform fails validation (0.13.177 trace 04:46: it
+          //    can carry stray separator lines), fall back to the RAW
+          //    canonical — the one spelling guaranteed to re-parse to the
+          //    current document.
+          const markerPreserving = preserveGeneratedBulletMarkers(
+            lastMarkdownRef.current,
+            canonical
+          )
+          const canonicalFallback = {
+            markdown: markerPreserving !== canonical ? markerPreserving : canonical,
+            preserved: true,
+            reason: 'generated-scratch-flush'
+          }
+          const retry = publishSourceSyncResult({
+            result: canonicalFallback,
+            canonical,
+            expectedDoc: viewRef.current?.state.doc,
+            validationSite: 'editor-api-flush',
+            notifyChange: false,
+            boundary: 'forced-flush'
+          })
+          if (retry?.ok) {
+            if (Array.isArray(globalThis.__hmFlushTrace)) {
+              globalThis.__hmFlushTrace.push({
+                phase: 'scratch-canonical-fallback',
+                trigger: coordinated?.reason || 'source-document-mismatch',
+                from: preserved?.reason || null
+              })
+            }
+            clearPendingRichFlush?.()
+            return retry.publication.markdown
+          }
+          coordinated = retry
+        }
+        if (!coordinated?.ok) {
+          const reason = coordinated?.reason || 'source-document-mismatch'
+          if (Array.isArray(globalThis.__hmFlushTrace)) {
+            globalThis.__hmFlushTrace.push({
+              phase: 'source-integrity-failed',
+              reason
+            })
+          }
+          reportSourceSyncFailure?.(reason)
+          return null
+        }
+        clearPendingRichFlush?.()
+        return coordinated.publication.markdown
+      }
+
+      // Compatibility for tests or embedders that instantiate createEditorApi
+      // without the Phase-A coordinator bridge. HorseMD's Editor always passes
+      // the bridge, so normal forced flushes use candidate/proof-bound publish.
+      const integrity = validateSourceCandidate?.(
+        preserved.markdown,
+        viewRef.current?.state.doc,
+        canonical,
+        lastMarkdownRef.current,
+        preserved.reason,
+        preserved.integrityProof,
+        'editor-api-flush'
+      )
+      if (integrity && integrity.ok === false) {
+        if (Array.isArray(globalThis.__hmFlushTrace)) {
+          globalThis.__hmFlushTrace.push({
+            phase: 'source-integrity-failed',
+            reason: integrity.reason || 'source-document-mismatch'
+          })
+        }
+        reportSourceSyncFailure?.(integrity.reason || 'source-document-mismatch')
+        return null
+      }
       lastMarkdownRef.current = preserved.markdown
       canonicalMarkdownRef.current = canonical
       clearPendingRichFlush?.()
       return preserved.markdown
-    } catch {
+    } catch (error) {
+      if (Array.isArray(globalThis.__hmFlushTrace)) {
+        globalThis.__hmFlushTrace.push({
+          phase: 'flush-error',
+          force,
+          error: error?.message || error?.name || 'unknown'
+        })
+      }
       return null
     }
   }

@@ -19,8 +19,9 @@ const schema = new Schema({
     bullet_list: { content: 'list_item+', group: 'block' },
     list_item: { content: 'paragraph block*' },
     table: { content: 'table_row+', group: 'block' },
-    table_row: { content: 'table_cell+' },
+    table_row: { content: '(table_cell | table_header)+' },
     table_cell: { content: 'paragraph+' },
+    table_header: { content: 'paragraph+' },
     image: { group: 'block', atom: true, attrs: { src: { default: '' } } },
     inline_image: { group: 'inline', inline: true, atom: true, attrs: { src: { default: '' } } },
     inline_math: { group: 'inline', inline: true, atom: true, attrs: { value: { default: '' } } },
@@ -36,7 +37,9 @@ const paragraph = (value) => schema.node('paragraph', null, text(value))
 const heading = (value, level = 1) => schema.node('heading', { level }, text(value))
 const codeBlock = (value) => schema.node('code_block', null, text(value))
 const cell = (value) => schema.node('table_cell', null, paragraph(value))
+const headerCell = (value) => schema.node('table_header', null, paragraph(value))
 const row = (...values) => schema.node('table_row', null, values.map(cell))
+const headerRow = (...values) => schema.node('table_row', null, values.map(headerCell))
 const table = (...rows) => schema.node('table', null, rows)
 const listItem = (value) => schema.node('list_item', null, paragraph(value))
 const bulletList = (...values) => schema.node('bullet_list', null, values.map(listItem))
@@ -195,11 +198,19 @@ const cases = []
     '| Gamma | `npm run build` | final |'
   ].join('\n')
   const pmDoc = doc(table(
-    row('Item', 'Command', 'Note'),
+    headerRow('Item', 'Command', 'Note'),
     row('Alpha', 'npm run build', 'repeated'),
     row('Beta', 'prefix git status suffix', 'repeated'),
     row('Gamma', 'npm run build', 'final')
   ))
+  assertTextRoundTrip({
+    label: 'table header cell local offset',
+    markdown,
+    pmDoc,
+    token: 'Command',
+    local: 4,
+    pmText: 'Command'
+  })
   assertTextRoundTrip({
     label: 'table inline code local offset',
     markdown,
@@ -234,6 +245,42 @@ const cases = []
     pmText: code
   })
   cases.push('fenced code block')
+}
+
+{
+  const markdown = 'Before\n\n```js\n\n```\n\nAfter\n'
+  const pmDoc = doc(paragraph('Before'), codeBlock(''), paragraph('After'))
+  const rawStart = markdown.indexOf('```js')
+  const pmPos = nthNodePos(pmDoc, 'code_block') + 1
+  assert.equal(
+    pmPosToMarkdownOffset(markdown, pmPos, pmDoc, remark),
+    rawStart,
+    'empty fenced code block must map to its own opening fence, not a neighbouring blank-line gap'
+  )
+  assert.deepEqual(
+    markdownOffsetToPmPos(markdown, rawStart, pmDoc, remark),
+    { pos: pmPos, atom: false },
+    'empty fenced code block opening fence must map back to its code_block content position'
+  )
+  cases.push('empty fenced code block')
+}
+
+{
+  const markdown = '\uFEFFBefore\r\n\r\n~~~js\r\n\r\n~~~\r\n\r\nAfter\r\n'
+  const pmDoc = doc(paragraph('Before'), codeBlock(''), paragraph('After'))
+  const rawStart = markdown.indexOf('~~~js')
+  const pmPos = nthNodePos(pmDoc, 'code_block') + 1
+  assert.equal(
+    pmPosToMarkdownOffset(markdown, pmPos, pmDoc, remark),
+    rawStart,
+    'BOM+CRLF empty tilde code block must map to its physical opening fence'
+  )
+  assert.deepEqual(
+    markdownOffsetToPmPos(markdown, rawStart, pmDoc, remark),
+    { pos: pmPos, atom: false },
+    'BOM+CRLF tilde opening fence must map back to the empty code_block content position'
+  )
+  cases.push('BOM CRLF empty tilde code block')
 }
 
 {

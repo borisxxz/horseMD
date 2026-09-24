@@ -16,6 +16,7 @@ import { tabAtCursorKeymap } from './editor-codeblock-tab.js'
 import { renderHtmlNodeView, remarkMergeInlineHtml } from './editor-html.js'
 import { remarkUnwrapNonAsciiAutolinks } from './editor-autolink.js'
 import { remarkNormalizeCodeOnlyLinkLabels } from './editor-link-labels.js'
+import { remarkPreserveLiteralTripleBacktickTextBlocks } from './editor-literal-backticks.js'
 import { createMermaidPreviewRenderer, createMermaidSplitPlugin } from './editor-mermaid.js'
 import {
   tableBreakKeymap,
@@ -55,7 +56,18 @@ const mermaidLanguage = LanguageDescription.of({
   alias: ['mermaid', 'mmd'],
   extensions: ['mmd', 'mermaid'],
   async load() {
-    return new LanguageSupport(StreamLanguage.define(() => ({ token: () => null })))
+    // StreamLanguage.define takes the stream-parser SPEC OBJECT ({token, ...}),
+    // and a no-op token MUST consume the stream (readToken throws "failed to
+    // advance" after 10 zero-width calls). The original factory-function spec
+    // left token undefined and crashed with "token is not a function" the
+    // moment a mermaid block's editor parsed — e.g. the welcome document's
+    // diagram, on every build up to and including 0.13.207.
+    return new LanguageSupport(StreamLanguage.define({
+      token: (stream) => {
+        stream.next()
+        return null
+      }
+    }))
   }
 })
 
@@ -193,7 +205,7 @@ export function createConfiguredCrepe({
 
     ctx.update(prosePluginsCtx, (plugins) => [
       createStrikeGuardPlugin(),
-      createBlockHandleGutterPlugin(),
+      createBlockHandleGutterPlugin(ctx),
       ...plugins,
       tableBreakKeymap(),
       createInlineCodeEditingPlugin({
@@ -233,6 +245,7 @@ export function createConfiguredCrepe({
       ...plugins,
       { plugin: remarkStripLeadingSpaceSentinel, options: undefined },
       { plugin: remarkNormalizeCodeOnlyLinkLabels, options: undefined },
+      { plugin: remarkPreserveLiteralTripleBacktickTextBlocks, options: undefined },
       { plugin: remarkUnwrapNonAsciiAutolinks, options: undefined },
       { plugin: remarkFrontmatter, options: undefined },
       { plugin: brToBreakRemarkPlugin, options: undefined },

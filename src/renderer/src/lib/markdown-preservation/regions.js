@@ -3,17 +3,329 @@ import {
   sourceVisibleIndex,
   sourceVisiblePositionAtRaw
 } from '../../mode-visible-map.js'
+import { LEADING_SPACE_SENTINEL } from '../markdown-leading-space.js'
 import { decodeNamedCharacterReference } from 'decode-named-character-reference'
 import {
   adaptCanonicalRegionToSource,
   canonicalFreshTextToSource,
   canonicalTextToSource,
+  commonChange,
   lineAt,
   lineIndexAt,
   lineEndingNear,
   markdownLines,
   rawOffsetAtVisible
 } from './core.js'
+
+// When a paragraph begins with one authored literal space, remark-stringify
+// first emits `&#x20;`, which the source layer stores as `U+200B + space`.
+// Once the user adds a second ordinary space after the list marker, the
+// canonical spelling becomes two plain spaces and the sentinel must disappear.
+// A normal visible-offset patch starts after the sentinel, so it otherwise
+// survives forever and makes source/canonical diverge on the next keystroke.
+export const reconcileLeadingSpaceSentinelTransition = ({
+  source,
+  previous,
+  next,
+  markdown
+}) => {
+  const { start, previousEnd, nextEnd } = commonChange(previous, next)
+  const previousStartLine = lineAt(previous, start)
+  const previousEndLine = lineAt(previous, Math.max(start, previousEnd - 1))
+  const nextStartLine = lineAt(next, start)
+  const nextEndLine = lineAt(next, Math.max(start, nextEnd - 1))
+  if (
+    previousStartLine.start !== previousEndLine.start ||
+    nextStartLine.start !== nextEndLine.start ||
+    /\\r|\\n/.test(next.slice(start, nextEnd))
+  ) return null
+
+  const previousLineText = previous.slice(previousStartLine.start, previousStartLine.end)
+  const nextLineText = next.slice(nextStartLine.start, nextStartLine.end)
+  if (
+    !previousLineText.includes('&#x20;') ||
+    nextLineText.includes('&#x20;')
+  ) return null
+
+  const previousVisible = sourceVisibleIndex(previousLineText).text
+  const nextVisible = sourceVisibleIndex(nextLineText).text
+  const sentinel = `${LEADING_SPACE_SENTINEL} `
+  const sourceLines = markdownLines(source)
+  const sourceCandidates = sourceLines
+    .filter((line) => line.text.includes(sentinel))
+    .filter((line) => sourceVisibleIndex(line.text).text === previousVisible)
+  if (sourceCandidates.length !== 1) return null
+
+  const resultLines = markdownLines(markdown)
+  let resultCandidates = resultLines
+    .filter((line) => line.text.includes(sentinel))
+    .filter((line) => sourceVisibleIndex(line.text).text === previousVisible)
+
+  // RS-77: deleting the entire visible body of a sentinel-backed list row can
+  // leave `localized-change` with a result line whose visible text is now empty.
+  // The old lookup searched only by the previous visible body and therefore
+  // could not find the already-patched row. For this exact zero-visible case,
+  // fall back to the same line ordinal only when the edit stayed single-line,
+  // source/result line counts are unchanged, and that result line still owns
+  // the sentinel. The final visible equality check below remains authoritative.
+  if (resultCandidates.length === 0 && nextVisible === '' && sourceLines.length === resultLines.length) {
+    const sourceCandidate = sourceCandidates[0]
+    const sourceLineIndex = sourceLines.findIndex((line) =>
+      line.start === sourceCandidate.start && line.end === sourceCandidate.end
+    )
+    const positionalCandidate = sourceLineIndex >= 0 ? resultLines[sourceLineIndex] : null
+    if (positionalCandidate?.text.includes(sentinel)) resultCandidates = [positionalCandidate]
+  }
+  if (resultCandidates.length !== 1) return null
+
+  const candidate = resultCandidates[0]
+  const correctedLine = candidate.text.replace(LEADING_SPACE_SENTINEL, '')
+  if (sourceVisibleIndex(correctedLine).text !== nextVisible) return null
+
+  return {
+    markdown: markdown.slice(0, candidate.start) +
+      correctedLine +
+      markdown.slice(candidate.end),
+    reason: 'leading-space-sentinel-reconciled'
+  }
+}
+
+// RS-76: a list row created with source-owned leading-space syntax can later
+// lose all visible body text while intentionally retaining horizontal spaces.
+// On a globally-diverged document the generic visible mappers cannot locate
+// that zero-visible tail edit. Prove the complete final-row transition instead:
+// canonical must change only its last row from `* &#x20;...text` to a spaces-only
+// bullet row, and authored source must end in the corresponding sentinel row.
+// The sentinel is removed because it would reparse as real paragraph text once
+// no non-whitespace body remains.
+export const preserveDivergedLeadingSpaceListWhitespaceTail = ({ source, previous, next }) => {
+  const tail = (value) => {
+    const body = String(value || '').replace(/(?:\r?\n)+$/, '')
+    const start = body.lastIndexOf('\n') + 1
+    return { prefix: body.slice(0, start), line: body.slice(start) }
+  }
+  const sourceTail = tail(source)
+  const previousTail = tail(previous)
+  const nextTail = tail(next)
+  if (previousTail.prefix !== nextTail.prefix || previousTail.line === nextTail.line) return null
+
+  const previousRow = previousTail.line.match(
+    /^(\s*)([-+*])([ \t]+)&#x20;([ \t]*)(\S.*)$/
+  )
+  const nextRow = nextTail.line.match(/^(\s*)([-+*])([ \t]+)$/)
+  const authoredRow = sourceTail.line.match(
+    /^(\s*)([-+*])([ \t]+)\u200B([ \t]+)(\S.*)$/
+  )
+  if (!previousRow || !nextRow || !authoredRow) return null
+  if (
+    previousRow[1] !== nextRow[1] ||
+    previousRow[2] !== nextRow[2] ||
+    authoredRow[1] !== previousRow[1]
+  ) return null
+
+  // `&#x20;` is exactly one authored leading space. The source sentinel is
+  // syntax only, so the bytes after it must equal the decoded canonical body.
+  const canonicalBody = ` ${previousRow[4]}${previousRow[5]}`
+  const authoredBody = `${authoredRow[4]}${authoredRow[5]}`
+  if (canonicalBody !== authoredBody) return null
+
+  const nextWhitespace = nextTail.line.slice(nextRow[1].length + nextRow[2].length)
+  const replacement = authoredRow[1] + authoredRow[2] + nextWhitespace
+  return {
+    markdown: sourceTail.prefix + replacement + source.slice(
+      sourceTail.prefix.length + sourceTail.line.length
+    ),
+    preserved: true,
+    reason: 'diverged-leading-space-list-whitespace-tail'
+  }
+}
+
+// RS-78: a globally-diverged document can still make one exact local edit at
+// its tail: an existing bullet item's non-empty body becomes empty while the
+// bullet slot itself survives. Global visible alignment is intentionally unable
+// to locate this safely, so prove the raw final row instead. Previous and next
+// canonical must differ only in that final row; its bullet syntax is unchanged;
+// and the authored final row must be the corresponding bullet body. Only the
+// authored body bytes are removed — marker spelling and spacing remain authored.
+export const preserveDivergedTailBulletBodyEmptied = ({ source, previous, next }) => {
+  const tail = (value) => {
+    const text = String(value || '')
+    const body = text.replace(/(?:\r?\n)+$/, '')
+    const start = body.lastIndexOf('\n') + 1
+    return { prefix: body.slice(0, start), line: body.slice(start), text }
+  }
+  const sourceTail = tail(source)
+  const previousTail = tail(previous)
+  const nextTail = tail(next)
+  if (previousTail.prefix !== nextTail.prefix || previousTail.line === nextTail.line) return null
+
+  const previousRow = previousTail.line.match(/^(\s*)([-+*])([ \t]+)(.*\S)[ \t]*$/)
+  const nextRow = nextTail.line.match(/^(\s*)([-+*])([ \t]+)$/)
+  const authoredRow = sourceTail.line.match(/^(\s*)([-+*])([ \t]+)(.*\S)[ \t]*$/)
+  if (!previousRow || !nextRow || !authoredRow) return null
+  if (
+    previousRow[1] !== nextRow[1] ||
+    previousRow[2] !== nextRow[2] ||
+    previousRow[3] !== nextRow[3] ||
+    authoredRow[1] !== previousRow[1]
+  ) return null
+
+  const previousBodyVisible = sourceVisibleIndex(previousRow[4]).text
+  const authoredBodyVisible = sourceVisibleIndex(authoredRow[4]).text
+  if (!previousBodyVisible || authoredBodyVisible !== previousBodyVisible) return null
+
+  const replacement = authoredRow[1] + authoredRow[2] + authoredRow[3]
+  return {
+    markdown: sourceTail.prefix + replacement + sourceTail.text.slice(
+      sourceTail.prefix.length + sourceTail.line.length
+    ),
+    preserved: true,
+    reason: 'diverged-tail-bullet-body-emptied'
+  }
+}
+
+const displayMathBlocks = (markdown) => {
+  const value = String(markdown || '')
+  const lines = markdownLines(value)
+  const blocks = []
+  let open = null
+  for (const line of lines) {
+    if (!/^ {0,3}\$\$\s*$/.test(line.text)) continue
+    if (!open) {
+      open = {
+        openStart: line.start,
+        openEnd: line.end,
+        contentStart: line.end + (value[line.end] === '\n' ? 1 : 0),
+        openLine: line.text
+      }
+      continue
+    }
+    blocks.push({
+      ...open,
+      closeStart: line.start,
+      closeEnd: line.end,
+      closeLine: line.text
+    })
+    open = null
+  }
+  return blocks
+}
+
+// The raw bytes between paired `$$` rows include the EOL that terminates the
+// final content row, while the ProseMirror code_block text does not. One
+// terminal EOL is therefore structural. This also makes `$$\n\n$$` and
+// `$$\n$$` equivalent empty blocks, but preserves any additional blank row as
+// real math content.
+const displayMathSemanticContent = (value) => String(value || '')
+  .replace(/\r\n|\r/g, '\n')
+  .replace(/\n$/, '')
+
+// Display-math content is serialized as a LaTeX code_block bounded by paired
+// `$$` rows. Its first and later CodeMirror edits must replace only that content
+// region. Letting the generic middle-block mapper own the insertion adds a blank
+// row before the closing `$$`, which changes the parsed code_block text by one
+// trailing newline and creates a first-divergence on every keystroke.
+export const preserveDisplayMathBlockTextChange = ({
+  source,
+  previous,
+  next,
+  start
+}) => {
+  const previousBlocks = displayMathBlocks(previous)
+  const nextBlocks = displayMathBlocks(next)
+  const previousIndex = previousBlocks.findIndex((block) =>
+    start >= block.contentStart && start <= block.closeStart
+  )
+  if (previousIndex < 0 || previousIndex >= nextBlocks.length) return null
+  const previousBlock = previousBlocks[previousIndex]
+  const nextBlock = nextBlocks[previousIndex]
+  if (
+    previousBlock.openLine !== nextBlock.openLine ||
+    previousBlock.closeLine !== nextBlock.closeLine ||
+    previous.slice(0, previousBlock.openStart) !== next.slice(0, nextBlock.openStart) ||
+    previous.slice(previousBlock.closeEnd) !== next.slice(nextBlock.closeEnd)
+  ) return null
+
+  const sourceBlocks = displayMathBlocks(source)
+  const sourceBlock = sourceBlocks[previousIndex]
+  if (!sourceBlock) return null
+  const sourceContent = source.slice(sourceBlock.contentStart, sourceBlock.closeStart)
+  const canonicalContent = previous.slice(previousBlock.contentStart, previousBlock.closeStart)
+  if (
+    displayMathSemanticContent(sourceContent) !==
+    displayMathSemanticContent(canonicalContent)
+  ) return null
+
+  const nextContent = next.slice(nextBlock.contentStart, nextBlock.closeStart)
+  const eol = lineEndingNear(source, sourceBlock.contentStart)
+  const replacement = nextContent.replace(/\r\n|\r|\n/g, eol)
+  return {
+    markdown: source.slice(0, sourceBlock.contentStart) +
+      replacement +
+      source.slice(sourceBlock.closeStart),
+    preserved: true,
+    reason: 'display-math-block-content-change',
+    sourceContent,
+    canonicalContent,
+    nextContent
+  }
+}
+
+const fencedBlocks = (markdown) => {
+  const source = String(markdown || '')
+  const lines = markdownLines(source)
+  const blocks = []
+  let open = null
+  for (const line of lines) {
+    // `markdownLines` deliberately retains the CR byte in a CRLF row so raw
+    // offsets remain physical-source offsets. Classify Markdown syntax against
+    // the logical line without that terminator; JavaScript `.` does not match
+    // `\r`, which previously made every CRLF opening fence invisible while the
+    // closing `\s*` still appeared valid.
+    const lineText = line.text.endsWith('\r') ? line.text.slice(0, -1) : line.text
+    if (!open) {
+      const match = lineText.match(/^ {0,3}(`{3,}|~{3,})(.*)$/)
+      if (match) {
+        const fenceOffset = lineText.indexOf(match[1])
+        const fenceStart = line.start + fenceOffset
+        const fenceEnd = fenceStart + match[1].length
+        open = {
+          openStart: line.start,
+          openEnd: line.end,
+          contentStart: line.end + (source[line.end] === '\n' ? 1 : 0),
+          openLine: lineText,
+          indent: lineText.slice(0, fenceOffset),
+          char: match[1][0],
+          length: match[1].length,
+          fenceStart,
+          fenceEnd,
+          infoStart: fenceEnd,
+          infoEnd: line.start + lineText.length,
+          infoRaw: match[2]
+        }
+      }
+      continue
+    }
+    const close = lineText.match(/^ {0,3}(`{3,}|~{3,})\s*$/)
+    if (!close || close[1][0] !== open.char || close[1].length < open.length) continue
+    blocks.push({
+      ...open,
+      closeStart: line.start,
+      closeEnd: line.end,
+      closeLine: lineText
+    })
+    open = null
+  }
+  return blocks
+}
+
+export const fencedCodeBlockAt = (markdown, offset) => {
+  const source = String(markdown || '')
+  const safe = Math.max(0, Math.min(Number(offset) || 0, source.length))
+  return fencedBlocks(source).find((block) =>
+    safe >= block.openStart && safe <= block.closeEnd
+  ) || null
+}
 
 const lineRegion = (markdown, start, end) => {
   const first = lineAt(markdown, start)
@@ -84,9 +396,73 @@ export const preserveLocallyAlignedTextChange = ({
     return null
   }
 
-  const rawStart = rawOffsetAtVisible(source, startVisible)
-  const rawEnd = rawOffsetAtVisible(source, endVisible)
+  let rawStart = rawOffsetAtVisible(source, startVisible)
+  let rawEnd = rawOffsetAtVisible(source, endVisible)
   if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || rawStart > rawEnd) return null
+
+  // An insertion whose editor position sits AFTER an invisible syntax delimiter
+  // (a closing inline-code backtick, `**`, `~~`) that ends at the line end
+  // collapses onto the delimiter itself: the delimiter byte carries no visible
+  // index, so both "before" and "after" round-trip to the same backward-
+  // affinity position (0.13.194 trace-79495: typing after a whole-paragraph
+  // inline-code span spliced INSIDE the span, and validation failed closed).
+  // Recover the lost side from the canonical delta itself: when the previous
+  // canonical places the change at/after the closing delimiter, re-anchor the
+  // insertion past every invisible-syntax byte of that line's tail. The line's
+  // visible text still pins the location, so this cannot drift to another line.
+  if (
+    start === previousEnd &&
+    nextEnd > start &&
+    rawStart === rawEnd &&
+    previousStartLine.start === previousEndLine.start &&
+    start === previousEndLine.end
+  ) {
+    const previousTail = previous.slice(previousEndLine.start, start)
+    const closingMatch = /(?:`+|\*\*|__|~~)[ \t]*$/.exec(previousTail)
+    if (closingMatch) {
+      const sourceLine = lineAt(source, rawStart)
+      // A CRLF document leaves the CR inside the line tail; it is not syntax.
+      const sourceTail = source.slice(sourceLine.start, sourceLine.end)
+        .replace(/\r$/, '')
+      const sourceClosing = /(?:`+|\*\*|__|~~)[ \t]*$/.exec(sourceTail)
+      if (
+        sourceClosing &&
+        sourceVisibleIndex(sourceTail).text ===
+          sourceVisibleIndex(previousTail).text &&
+        rawStart <= sourceLine.start + sourceClosing.index
+      ) {
+        rawStart = sourceLine.start + sourceClosing.index + sourceClosing[0].length
+        rawEnd = rawStart
+      }
+    }
+  }
+
+  // Markdown trailing spaces are intentionally absent from the visible stream.
+  // For a pure insertion at the canonical line's raw end, a backward-affinity
+  // visible position therefore maps to the byte before those spaces. Inserting
+  // there turns `text ` + `body` into `textbody ` even though the editor made
+  // `text body`. Move only this exact line-end insertion across an authored
+  // horizontal-whitespace tail; replacements/deletions and edits before the
+  // tail retain their existing coordinates.
+  if (
+    start === previousEnd &&
+    nextEnd > start &&
+    start === previousStartLine.end &&
+    rawStart === rawEnd &&
+    /[ \t]$/.test(previous.slice(previousStartLine.start, previousStartLine.end))
+  ) {
+    const sourceLine = lineAt(source, rawStart)
+    const sourceTail = source.slice(rawStart, sourceLine.end)
+    if (
+      /^[ \t]+$/.test(sourceTail) &&
+      sourceVisibleIndex(source.slice(sourceLine.start, sourceLine.end)).text ===
+        sourceVisibleIndex(previous.slice(previousStartLine.start, previousStartLine.end)).text
+    ) {
+      rawStart = sourceLine.end
+      rawEnd = sourceLine.end
+    }
+  }
+
   return {
     markdown: source.slice(0, rawStart) +
       adaptCanonicalRegionToSource(replacement, source, { start: rawStart, end: rawEnd }) +
@@ -281,6 +657,82 @@ export const preserveDivergedBlockTextChange = ({
   const previousText = previous.slice(previousBlock.start, previousBlock.end)
   const nextText = next.slice(nextBlock.start, nextBlock.end)
   if (!previousText || !nextText || previousText === nextText) return null
+
+  // RS-50: generated scratch persists an otherwise-empty GFM task item with a
+  // lone U+200B source sentinel because bare `- [ ] ` reparses as ordinary
+  // bracket text. On reopen the remark plugin strips that sentinel from the PM
+  // paragraph, so the next canonical baseline is `* [ ] <br />`. The first
+  // typed body text must CONSUME the source sentinel; the generic diverged-block
+  // fallback inserts before it and leaves `text<U+200B>`, which then fails the
+  // integrity gate. Prove the exact empty-task lifecycle and map repeated rows
+  // by ordinal before replacing only the sentinel body bytes.
+  const taskRow = (text) => {
+    const match = String(text || '').match(
+      /^([ \t]*)([-+*]|\d{1,9}[.)])([ \t]+)\[([ xX])\]([ \t]+)(.*)$/i
+    )
+    if (!match) return null
+    return {
+      indent: match[1],
+      marker: match[2],
+      spacing: match[3],
+      checked: match[4].toLowerCase(),
+      taskSpacing: match[5],
+      body: match[6],
+      kind: /^\d/.test(match[2]) ? 'ordered' : 'bullet',
+      bodyOffset: match[1].length + match[2].length + match[3].length +
+        3 + match[5].length
+    }
+  }
+  const previousTask = taskRow(previousText)
+  const nextTask = taskRow(nextText)
+  const isEmptyTaskPlaceholder = (body) => {
+    const value = String(body || '')
+    // preserveRichMarkdownSourceCore() normalizes empty list placeholders
+    // before dispatch, so the same editor-owned task slot can arrive either
+    // as raw `<br />` (direct mapper tests) or as an empty/whitespace body
+    // (the real façade path). Source still has to prove the exact U+200B
+    // sentinel row below before this branch can publish anything.
+    return !value.trim() || /^<br\s*\/?>\s*$/i.test(value)
+  }
+  if (
+    previousTask &&
+    nextTask &&
+    previousTask.kind === nextTask.kind &&
+    previousTask.checked === nextTask.checked &&
+    isEmptyTaskPlaceholder(previousTask.body) &&
+    nextTask.body.trim() &&
+    !isEmptyTaskPlaceholder(nextTask.body)
+  ) {
+    const sameTaskShape = (row, target) => row &&
+      row.kind === target.kind &&
+      row.checked === target.checked &&
+      row.indent.length === target.indent.length
+    const previousRows = markdownLines(previous)
+      .map((line) => ({ line, row: taskRow(line.text) }))
+      .filter(({ row }) => sameTaskShape(row, previousTask) && isEmptyTaskPlaceholder(row.body))
+    const targetOrdinal = previousRows.findIndex(({ line }) => (
+      line.start === previousBlock.start && line.end === previousBlock.end
+    ))
+    const sourceRows = markdownLines(source)
+      .map((line) => ({ line, row: taskRow(line.text) }))
+      .filter(({ row }) => (
+        sameTaskShape(row, previousTask) && row.body === LEADING_SPACE_SENTINEL
+      ))
+    if (
+      targetOrdinal >= 0 &&
+      sourceRows.length === previousRows.length &&
+      sourceRows[targetOrdinal]
+    ) {
+      const { line: sourceLine, row: sourceTask } = sourceRows[targetOrdinal]
+      const bodyStart = sourceLine.start + sourceTask.bodyOffset
+      const replacement = canonicalTextToSource(nextTask.body)
+      return {
+        markdown: source.slice(0, bodyStart) + replacement + source.slice(sourceLine.end),
+        preserved: true,
+        reason: 'empty-task-sentinel-filled'
+      }
+    }
+  }
   if (
     start < previousBlock.start ||
     previousEnd > previousBlock.end ||
@@ -361,6 +813,76 @@ export const preserveDivergedBlockTextChange = ({
   }
 }
 
+// RS-73: a source-authored standalone tail image can be parsed by remark as an
+// inline atom continuing the deepest preceding ordered-list paragraph. The
+// serializer then indents that image under the list, so a later rich Backspace
+// deletes the canonical image row while the authored source/canonical streams
+// are already permanently diverged. Generic visible mapping cannot own this:
+// image atoms contribute zero visible characters and a long document can have
+// unrelated earlier divergence. Claim only the exact final-image deletion.
+export const preserveDivergedTailImageDelete = ({ source, previous, next }) => {
+  const sourceText = String(source || '')
+  const previousText = String(previous || '')
+  const nextText = String(next || '')
+  if (!sourceText || !previousText || previousText === nextText) return null
+
+  const stripTrailingLineEndings = (value) => String(value || '').replace(/(?:\r\n|\r|\n)+$/, '')
+  const lastNonBlankIndex = (lines) => {
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      if (lines[index].text.trim()) return index
+    }
+    return -1
+  }
+  const previousLines = markdownLines(previousText)
+  const previousImageIndex = lastNonBlankIndex(previousLines)
+  if (previousImageIndex < 1) return null
+  const previousImageLine = previousLines[previousImageIndex]
+  const imageToken = previousImageLine.text.trim()
+  if (!imageToken.startsWith('![') || !imageToken.includes('](') || !imageToken.endsWith(')')) {
+    return null
+  }
+
+  // Removing this one final row must explain the complete canonical change.
+  // Do not ignore blank-line edits in the middle of the document; only terminal
+  // line-ending count is serializer-owned formatting here.
+  if (
+    stripTrailingLineEndings(previousText.slice(0, previousImageLine.start)) !==
+    stripTrailingLineEndings(nextText)
+  ) return null
+
+  let previousAnchorIndex = previousImageIndex - 1
+  while (previousAnchorIndex >= 0 && !previousLines[previousAnchorIndex].text.trim()) {
+    previousAnchorIndex -= 1
+  }
+  if (previousAnchorIndex < 0) return null
+  const previousAnchorVisible = sourceVisibleIndex(previousLines[previousAnchorIndex].text).text.trim()
+  if (!previousAnchorVisible) return null
+
+  const sourceLines = markdownLines(sourceText)
+  const sourceMatches = sourceLines.filter((line) => line.text.trim() === imageToken)
+  if (sourceMatches.length !== 1) return null
+  const sourceImageLine = sourceMatches[0]
+  if (sourceLines[lastNonBlankIndex(sourceLines)]?.start !== sourceImageLine.start) return null
+
+  const sourceImageIndex = sourceLines.findIndex((line) => line.start === sourceImageLine.start)
+  let sourceAnchorIndex = sourceImageIndex - 1
+  while (sourceAnchorIndex >= 0 && !sourceLines[sourceAnchorIndex].text.trim()) {
+    sourceAnchorIndex -= 1
+  }
+  if (sourceAnchorIndex < 0) return null
+  if (
+    sourceVisibleIndex(sourceLines[sourceAnchorIndex].text).text.trim() !== previousAnchorVisible
+  ) return null
+
+  const followingEol = sourceText.slice(sourceImageLine.end).match(/^(?:\r\n|\r|\n)/)?.[0] || ''
+  const removeEnd = sourceImageLine.end + followingEol.length
+  return {
+    markdown: sourceText.slice(0, sourceImageLine.start) + sourceText.slice(removeEnd),
+    preserved: true,
+    reason: 'diverged-tail-image-delete'
+  }
+}
+
 // A deletion that spans several canonical blocks (a whole tail, or rows from
 // several list trees) inside a diverged document defeats every localized
 // mapper above and previously rolled back to the OLD source — the deletion
@@ -414,11 +936,22 @@ export const preserveDivergedVisibleDelete = ({
     visibleIndex: deleteStartVis,
     visibleAffinity: 'backward'
   })
+  // P7b E2E (redis joinBackward replay): the source-side raw range must not
+  // delete invisible layout the canonical deletion did not delete. A visible
+  // delta confined to one line (no EOL inside the canonical's deleted range)
+  // must map with 'backward' end affinity too — 'forward' would hop the
+  // invisible run after the deleted text (blank line + fence opener) and eat
+  // it, corrupting the candidate (the fence vanished; the strict semantic
+  // gate rejected it and the user saw a warning). Multi-line canonical
+  // deletions keep 'forward' so layout BETWEEN deleted blocks goes with them.
+  const canonicalDeletedRange = String(previous || '').slice(start, previousEnd)
+  const canonicalDeletionSpansLines = /\n/.test(canonicalDeletedRange)
   const rawEnd = rawOffsetAtVisible(source, {
     visibleIndex: deleteEndVis,
-    visibleAffinity: 'forward'
+    visibleAffinity: canonicalDeletionSpansLines ? 'forward' : 'backward'
   })
   if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd) || rawStart > rawEnd) return null
+  if (!canonicalDeletionSpansLines && /\n/.test(source.slice(rawStart, rawEnd))) return null
 
   // Verify the raw range actually deletes what the canonical deleted (after
   // list markers are stripped — the canonical keeps them as syntax while the
@@ -553,6 +1086,33 @@ export const preserveChangedLineRegion = ({
   if (!sourceRegion) return null
 
   let replacementText = transformReplacement(next.slice(nextRegion.start, nextRegion.end))
+  // A canonical replacement spliced verbatim into an authored row rewrites
+  // untouched author spelling: `- 当用户…` became `* 当用户…` (0.13.186
+  // trace 15:48:45 — committed byte damage on a row the user never touched).
+  // When both the replaced source region and the replacement are list rows of
+  // the same kind at the same indent, keep the AUTHORED marker prefix and take
+  // only the canonical body. Single-row only: a multi-row replacement brings
+  // its own structure and stays canonical.
+  {
+    const sourceSlice = source.slice(sourceRegion.start, sourceRegion.end)
+    const singleRow = (value) => {
+      const lines = String(value || '').split('\n').filter((line) => line.trim())
+      return lines.length === 1 ? lines[0] : null
+    }
+    const markerOf = (line) => String(line || '').match(/^(\s*)((?:[-+*])|(?:\d{1,9}[.)]))([ \t]+)(.*)$/)
+    const sourceRow = singleRow(sourceSlice)
+    const replacementRow = singleRow(replacementText)
+    const sourceMarker = sourceRow && markerOf(sourceRow)
+    const replacementMarker = replacementRow && markerOf(replacementRow)
+    if (
+      sourceMarker &&
+      replacementMarker &&
+      sourceMarker[1] === replacementMarker[1] &&
+      /^\d/.test(sourceMarker[2]) === /^\d/.test(replacementMarker[2])
+    ) {
+      replacementText = sourceMarker[1] + sourceMarker[2] + sourceMarker[3] + replacementMarker[4]
+    }
+  }
   // Tail zero-width insertion: canonical ends with a blank separator before a
   // new block (`\n\n`), but the authored file may end with a single line
   // ending (user style). Splicing the replacement directly would glue the new
@@ -581,6 +1141,44 @@ export const preserveChangedLineRegion = ({
     preserved: true,
     reason
   }
+}
+
+// RS-75: two adjacent empty list items have no visible body text, so a
+// visible-line comparator can mistake "final body became empty" for "final row
+// disappeared". Raw tail identity decides ownership before the broad tail
+// delete proof runs. Exact marker token/spacing is intentional: `1.` and `1)`
+// are distinct authored slots even when their visible bodies are both empty.
+const sameTailListSlotBodyEmptied = (previous, next) => {
+  const rawTailSlot = (value) => {
+    const body = String(value || '').replace(/(?:\r?\n)+$/, '')
+    const lineStart = body.lastIndexOf('\n') + 1
+    let line = body.slice(lineStart)
+    if (line.endsWith('\r')) line = line.slice(0, -1)
+    return { prefix: body.slice(0, lineStart), line }
+  }
+  const listTailSlot = (line) => String(line || '').match(
+    /^(\s*)([-+*]|\d{1,9}[.)])([ \t]+)(.*)$/
+  )
+  const emptyListBody = (body) => {
+    const text = String(body || '').trim()
+    return text === '' || /^<br\s*\/?>$/i.test(text)
+  }
+
+  const previousTail = rawTailSlot(previous)
+  const nextTail = rawTailSlot(next)
+  if (previousTail.prefix !== nextTail.prefix || previousTail.line === nextTail.line) return false
+
+  const previousSlot = listTailSlot(previousTail.line)
+  const nextSlot = listTailSlot(nextTail.line)
+  return Boolean(
+    previousSlot &&
+    nextSlot &&
+    previousSlot[1] === nextSlot[1] &&
+    previousSlot[2] === nextSlot[2] &&
+    previousSlot[3] === nextSlot[3] &&
+    !emptyListBody(previousSlot[4]) &&
+    emptyListBody(nextSlot[4])
+  )
 }
 
 // Deeply diverged documents (unclosed backticks, escaped markers, zero-width
@@ -678,6 +1276,11 @@ export const preserveDivergedTailBlockAppend = ({
     // only this serializer escape for tail-anchor comparison.
     .replace(/\\\|/g, '|')
     .replace(/\u200B/g, '')
+    // Crepe represents an empty trailing list item as `* <br />`, while the
+    // authored source keeps the same slot as `-`/`1. `. They are the same
+    // zero-visible tail anchor; retaining the placeholder would make a code
+    // fence typed after that item look like an unmapped divergence.
+    .replace(/<br\s*\/?>/gi, '')
   const equivalentLine = (left, right) =>
     markerNormalized(stripBacktickSpans(left.trimEnd())) ===
     markerNormalized(stripBacktickSpans(right.trimEnd()))
@@ -732,23 +1335,78 @@ export const preserveDivergedTailBlockAppend = ({
   const foldCase = start >= previousLineStart &&
     markerNormalized(nextLineAtStart).startsWith(markerNormalized(previousLine)) &&
     nextLineAtStart.length > previousLine.length
-  const freshRowCase = start > previousLineStart + previousLine.length &&
+  // RS-62: visible-line extraction can skip a punctuation-only raw tail row
+  // entirely (`-[ ] `, `-[] `, escaped literals, etc.). When that hidden raw
+  // final row is edited in place, the visible anchor remains the predecessor,
+  // which otherwise makes the changed row look like a brand-new row appended
+  // after the anchor. Prove raw slot identity first: if previous and next have
+  // the same prefix up to their final content row and only that row changed,
+  // this is an existing-tail-line edit, never a fresh-row append. Dedicated
+  // line mappers can then preserve the authored spelling without duplicating
+  // the old row plus the edited row.
+  const rawTailSlot = (value) => {
+    const body = String(value || '').replace(/(?:\r?\n)+$/, '')
+    const lineStart = body.lastIndexOf('\n') + 1
+    let line = body.slice(lineStart)
+    if (line.endsWith('\r')) line = line.slice(0, -1)
+    return { prefix: body.slice(0, lineStart), line }
+  }
+  const previousRawTailSlot = rawTailSlot(previous)
+  const nextRawTailSlot = rawTailSlot(next)
+  const rawTailEditedInPlace =
+    previousRawTailSlot.prefix === nextRawTailSlot.prefix &&
+    previousRawTailSlot.line !== nextRawTailSlot.line
+  const freshRowCase = !rawTailEditedInPlace &&
+    start > previousLineStart + previousLine.length &&
     !nextLineAtStart.startsWith(previousLine)
   // The canonical final line itself was deleted (a trailing list row or a
   // typed paragraph). The authored source must drop its matching final line.
   const previousLineCount = previous.split('\n').filter((line) => line === previousLine).length
   const nextLineCount = next.split('\n').filter((line) => line === previousLine).length
   const nextTailLine = lastVisibleLine(next)?.text
-  const deleteCase = start >= previousLineStart &&
+  // After the trailing row is deleted, canonical's new final line is the row
+  // that was IMMEDIATELY before it (the predecessor). Verifying that specific
+  // predecessor distinguishes a real deletion from a *replacement*: typing
+  // `-` + Space replaces a literal `\-` row with a new `* ` bullet item, and
+  // the new tail (`* `) can spuriously match an unrelated empty bullet item
+  // elsewhere in the document if we accept any equivalent line. Only the
+  // immediate predecessor may satisfy the deletion proof.
+  const previousPredecessorLine = lastVisibleLine(previous, 1)?.text
+  // RS-61: visible-line extraction can intentionally erase punctuation-only
+  // rows. For example a literal paragraph `-[ ] ` has no visible text after
+  // Markdown syntax stripping, even though the raw canonical row still exists.
+  // If the previous spelling was protected (`-\\[ ]`) and the serializer drops
+  // that escape on the next Space, visible-only deletion proof would think the
+  // predecessor became the new tail and delete the whole paragraph. Inspect the
+  // raw final content row too: a real deletion may leave only the predecessor,
+  // blank whitespace, or Crepe's editor-owned `<br />`; any other raw row is a
+  // replacement/edit and must fall through to the line-region mapper.
+  const nextRawTailLine = next.split('\n')
+    .reverse()
+    .map((line) => line.endsWith('\r') ? line.slice(0, -1) : line)
+    .find((line) => line.length > 0) || ''
+  const rawTailAllowsDeletion =
+    nextRawTailLine.trim() === '' ||
+    /^\s*<br\s*\/?>\s*$/i.test(nextRawTailLine) ||
+    (
+      previousPredecessorLine !== undefined &&
+      equivalentLine(previousPredecessorLine, nextRawTailLine)
+    )
+  const deleteCase = !sameTailListSlotBodyEmptied(previous, next) &&
+    start >= previousLineStart &&
     nextLineCount < previousLineCount &&
     nextLineCount === 0 &&
     // A deleted trailing row leaves the previous authored row as canonical's
     // new final line. A *replaced* row (`\`` -> `` `f` ``) changes spelling
     // instead, and must go through the fold path, not deletion.
     !!nextTailLine &&
+    rawTailAllowsDeletion &&
     (
       nextTailLine.trim() === '' ||
-      previous.split('\n').some((line) => equivalentLine(line, nextTailLine))
+      (
+        previousPredecessorLine !== undefined &&
+        equivalentLine(previousPredecessorLine, nextTailLine)
+      )
     )
   // Fence extension: the user types a fence row inside a tail fenced block, so
   // Crepe re-fences the whole block with a longer run (` ``` ` -> ` ```` `) and
@@ -1083,6 +1741,25 @@ export const preserveDivergedTailBlockAppend = ({
     if (/^\s*<br\s*\/?>\s*$/m.test(remaining)) return null
   } else if (deleteCase) {
     const tailBreaks = source.slice(sourceAnchor.start + sourceLine.length)
+    // RS-56: a rapid Backspace on a deepest nested list row can remove that
+    // row while ProseMirror lifts its empty paragraph into the parent list
+    // item. The canonical tail then ends in an indented standalone `<br />` at
+    // the deleted row's content column. The raw row deletion below is already
+    // strictly proven by deleteCase; classify only this nested-list shape so
+    // generated-scratch integrity can ignore exactly the editor-owned trailing
+    // paragraph without granting that exception to every tail-line deletion.
+    const sourceListMarker = sourceLine.match(/^(\s*)([-+*]|\d{1,9}[.)])(?=\s)/)
+    const previousListMarker = previousLine.match(/^(\s*)([-+*]|\d{1,9}[.)])(?=\s)/)
+    const trailingPlaceholder = String(next).match(
+      /(?:^|\r?\n)([ \t]*)<br\s*\/?>[ \t]*(?:(?:\r?\n)+)?$/i
+    )
+    const nestedEmptyListItemRemoved = Boolean(
+      sourceListMarker &&
+      previousListMarker &&
+      previousListMarker[1].length > 0 &&
+      trailingPlaceholder &&
+      trailingPlaceholder[1].length === previousListMarker[1].length
+    )
     // Deleting a leading-space paragraph down to its bare whitespace leaves a
     // blank canonical row (` `); the authored row must shrink to that blank
     // rather than keep the deleted content.
@@ -1090,7 +1767,9 @@ export const preserveDivergedTailBlockAppend = ({
     return {
       markdown: source.slice(0, sourceAnchor.start) + blankTail + tailBreaks,
       preserved: true,
-      reason: 'diverged-tail-line-delete'
+      reason: nestedEmptyListItemRemoved
+        ? 'nested-empty-list-item-removed'
+        : 'diverged-tail-line-delete'
     }
   } else {
     return null

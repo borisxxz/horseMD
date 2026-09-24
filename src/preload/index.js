@@ -7,6 +7,11 @@ const on = (channel) => (cb) => {
   return () => ipcRenderer.removeListener(channel, fn)
 }
 
+// Manual rich/source bug reproduction is opt-in at process launch. The main
+// process keeps the switch authoritative; the renderer only pays the tracing
+// cost when the switch is present.
+const inputTraceEnabled = ipcRenderer.sendSync('debug:inputTraceEnabled') === true
+
 const api = {
   // dialogs
   openFiles: () => ipcRenderer.invoke('dialog:openFiles'),
@@ -42,6 +47,9 @@ const api = {
   getPathForDroppedFile: (file) => webUtils.getPathForFile(file),
   classifyDroppedPaths: (paths) => ipcRenderer.invoke('fs:classifyPaths', paths),
   setShowHidden: (val) => ipcRenderer.invoke('settings:setShowHidden', val),
+
+  // Workspace-wide content search (issue #120).
+  searchWorkspace: (request) => ipcRenderer.invoke('search:workspace', request),
 
   // Sync workspaces: the renderer can register an explicitly selected root,
   // but never receives registry paths or arbitrary network/credential access.
@@ -105,12 +113,27 @@ const api = {
   windowClose: () => ipcRenderer.invoke('window:close'),
   windowIsMaximized: () => ipcRenderer.invoke('window:isMaximized'),
   windowToggleDevTools: () => ipcRenderer.invoke('window:toggleDevTools'),
+  // Settings › General: with close-to-tray on, closing the window hides it to
+  // the tray instead of quitting (tray icon / the show-hide shortcut bring it
+  // back).
+  setCloseToTray: (enabled) => ipcRenderer.invoke('window:setCloseToTray', enabled),
+  // Command palette + global keybindings: hide/show the window (main owns the
+  // window) and push the user's effective OS-level accelerators. Only command
+  // ids whitelisted in the main process are registered.
+  toggleWindowVisibility: () => ipcRenderer.invoke('window:toggleVisibility'),
+  setGlobalShortcuts: (accelerators) => ipcRenderer.invoke('window:setGlobalShortcuts', accelerators),
 
   // update check (notify-only)
   checkUpdate: () => ipcRenderer.invoke('update:check'),
   setMenuKeybindings: (accelerators) => ipcRenderer.invoke('menu:setKeybindings', accelerators),
   getMenuKeybindings: () => ipcRenderer.invoke('menu:getKeybindings'),
   getMenuSnapshot: () => ipcRenderer.invoke('menu:getSnapshot'),
+
+  // Development-only manual input tracing. The main process ignores these
+  // calls unless HorseMD was launched with --horsemd-input-trace.
+  inputTraceEnabled,
+  getInputTraceInfo: () => ipcRenderer.invoke('debug:inputTraceInfo'),
+  writeInputTrace: (entry) => ipcRenderer.invoke('debug:inputTrace', entry),
 
   // app close: main asks before closing so the renderer can warn about unsaved
   // changes, then calls confirmAppClose() to proceed or cancelAppClose() to abort.
@@ -140,6 +163,11 @@ const api = {
     folderWorkspace: true,
     watch: true,
     windowControls: true,
+    // Desktop-only: closing the window can hide it to the system tray, with a
+    // global shortcut to bring it back.
+    closeToTray: true,
+    // Desktop-only: OS-level (globalShortcut) commands such as show/hide window.
+    globalShortcuts: true,
     devtools: true,
     pdfExport: true,
     htmlExport: true,

@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Sidebar from './components/Sidebar.jsx'
 import Outline from './components/Outline.jsx'
+import GlobalSearchPanel from './components/GlobalSearchPanel.jsx'
 import FloatingOutline from './components/FloatingOutline.jsx'
 import StatusBar from './components/StatusBar.jsx'
 import SaveFab from './components/SaveFab.jsx'
@@ -40,6 +41,7 @@ import { isTabDirty } from './lib/tab-state.js'
 import { applyCustomTheme, applyUserCss } from './customThemes.js'
 import { fireToast } from './ui.js'
 import { useFindReplace } from './hooks/useFindReplace.js'
+import { useGlobalSearch } from './hooks/useGlobalSearch.js'
 import { useOutline } from './hooks/useOutline.js'
 import { useAppLifecycle } from './hooks/useAppLifecycle.js'
 import { useColDrag } from './hooks/useColDrag.js'
@@ -56,7 +58,7 @@ import { usePandocExport } from './hooks/usePandocExport.js'
 import { useKeybindings } from './hooks/useKeybindings.js'
 import { useSystemColorScheme } from './hooks/useSystemColorScheme.js'
 import { useDropOpen } from './hooks/useDropOpen.js'
-import { buildElectronAcceleratorPayload } from './lib/commands/electron-accelerators.js'
+import { buildElectronAcceleratorPayload, buildGlobalAcceleratorPayload } from './lib/commands/electron-accelerators.js'
 import { createMenuHandlers, useGlobalKeys, useCommands } from './lib/menuHandlers.js'
 import { isAbsolutePath, isPlainTextDoc, loadSession, loadFolderRootsFromSession } from './paths.js'
 import { createReviewActions } from './lib/reviewActions.js'
@@ -268,6 +270,7 @@ export default function App() {
     tabsRef,
     activeIdRef,
     editorApis,
+    liveContentRef,
     editorHostRef,
     focusedTabRef,
     commitAllLive,
@@ -655,6 +658,12 @@ export default function App() {
     if (folderRoots.length) bumpRefresh()
   }, [settings.showHiddenFiles, bumpRefresh, folderRoots])
 
+  // Keep main's close-to-tray behavior in sync with the persisted preference
+  // (opt-in: both sides default to off, so this only pushes explicit choices).
+  useEffect(() => {
+    window.api.setCloseToTray?.(settings.closeToTray === true)
+  }, [settings.closeToTray])
+
   // Show a tab in the right (split) pane. If it's currently the active tab, move
   // the left pane to a different tab so the two panes differ.
   const openRight = useCallback((id) => {
@@ -856,6 +865,20 @@ export default function App() {
     })
   findStateRef.current = { open: find.open, query: find.query }
 
+  // Workspace-wide search (issue #120) — the third sidebar mode. Jump lands
+  // the in-document FindBar on the clicked match (see useGlobalSearch).
+  const { query: searchQuery, setQuery: setSearchQuery, results: searchResults, jumpToMatch } = useGlobalSearch({
+    roots: folderRoots,
+    openPaths,
+    tabsRef,
+    editorApis,
+    editorHostRef,
+    waitForEditorApi,
+    setFind,
+    runFind,
+    findInputRef
+  })
+
   // In split view, target the pane you're actually editing (last focused), as
   // long as it's one of the two visible panes; otherwise the active (left) tab.
   const pickEditableId = () => {
@@ -904,6 +927,19 @@ export default function App() {
   } = useKeybindings()
   useEffect(() => {
     window.api.setMenuKeybindings?.(buildElectronAcceleratorPayload(effectiveKeybindings))
+  }, [effectiveKeybindings])
+  // OS-level commands (show/hide window) are registered by the main process with
+  // globalShortcut, so the resolved binding has to be pushed there too. The reply
+  // names any combination the OS/another app already owns — the keyboard settings
+  // page surfaces that instead of failing silently.
+  const [globalShortcutStatus, setGlobalShortcutStatus] = useState(null)
+  useEffect(() => {
+    window.api
+      .setGlobalShortcuts?.(buildGlobalAcceleratorPayload(effectiveKeybindings))
+      .then((res) => {
+        if (res?.ok) setGlobalShortcutStatus({ accelerators: res.accelerators, unregistered: res.unregistered })
+      })
+      .catch(() => {})
   }, [effectiveKeybindings])
   handlers.current = createMenuHandlers({
     pickEditableId,
@@ -1062,6 +1098,7 @@ export default function App() {
         onHome={() => handlers.current.home()}
         onFiles={() => handlers.current.toggleFiles()}
         onOutline={() => handlers.current.toggleOutline()}
+        onSearch={() => handlers.current.globalSearch()}
         onSettings={openSettingsTab}
         onToggleSidebar={() => setSidebarOpen((v) => !v)}
       />
@@ -1126,6 +1163,16 @@ export default function App() {
                 syncSupported={syncWorkspaces.supported}
                 syncFolderPaths={syncWorkspaces.registered.map((entry) => entry.rootPath)}
                 onEnableSyncFolder={enableSyncFolder}
+              />
+            ) : sidebarMode === 'search' ? (
+              <GlobalSearchPanel
+                query={searchQuery}
+                onQuery={setSearchQuery}
+                results={searchResults}
+                t={t}
+                onJump={jumpToMatch}
+                onAddFolder={openFolder}
+                hasRoots={folderRoots.length > 0}
               />
             ) : (
               <Outline
@@ -1267,6 +1314,7 @@ export default function App() {
               onSetKeybindings={setKeybindings}
               onResetCommandKeybindings={resetCommandKeybindings}
               onResetAllKeybindings={resetAllKeybindings}
+              globalShortcutStatus={globalShortcutStatus}
               cloudSync={syncWorkspaces.supported}
               syncWorkspaces={syncWorkspaces}
               folderRoots={folderRoots}

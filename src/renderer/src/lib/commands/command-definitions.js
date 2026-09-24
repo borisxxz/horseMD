@@ -44,6 +44,7 @@ export const LEGACY_COMMAND_ALIASES = {
   toggleSidebar: 'view.toggleSidebar',
   toggleFiles: 'view.showFiles',
   toggleOutline: 'view.showOutline',
+  globalSearch: 'view.globalSearch',
   toggleSource: 'view.toggleSource',
   toggleTheme: 'view.cycleTheme',
   find: 'editor.find',
@@ -226,6 +227,16 @@ export const COMMAND_DEFINITIONS = [
     palette: true
   },
   {
+    id: 'view.globalSearch',
+    handler: 'globalSearch',
+    titleKey: 'cmd.globalSearch',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Mod+Shift+F'],
+    electronAccelerator: true,
+    palette: true
+  },
+  {
     id: 'view.toggleSource',
     handler: 'toggleSource',
     titleKey: 'cmd.source',
@@ -243,6 +254,24 @@ export const COMMAND_DEFINITIONS = [
     context: COMMAND_CONTEXTS.APP,
     defaultKeybindings: ['Mod+Shift+T'],
     electronAccelerator: true,
+    palette: true
+  },
+  {
+    // Unlike the other commands this one is NOT an Electron menu accelerator:
+    // it is registered in the main process with globalShortcut so it also works
+    // while the window is hidden to the tray. The renderer still owns the
+    // binding (recording, persistence, conflicts) and pushes the resolved
+    // accelerator to main; see buildGlobalAcceleratorPayload + the
+    // 'window:setGlobalShortcuts' IPC.
+    id: 'window.toggleVisibility',
+    handler: 'toggleWindowVisibility',
+    titleKey: 'cmd.toggleWindow',
+    fallbackTitle: 'Show / Hide Window',
+    category: COMMAND_CATEGORIES.VIEW,
+    context: COMMAND_CONTEXTS.APP,
+    defaultKeybindings: ['Alt+M'],
+    globalAccelerator: true,
+    capability: 'globalShortcuts',
     palette: true
   },
   {
@@ -291,6 +320,15 @@ export const COMMAND_DEFINITIONS = [
     category: COMMAND_CATEGORIES.EDITOR,
     context: COMMAND_CONTEXTS.EDITOR,
     defaultKeybindings: ['Mod+Alt+H'],
+    editorOwned: true,
+    configurable: false
+  },
+  {
+    id: 'editor.code.exit',
+    fallbackTitle: 'Exit Code Block',
+    category: COMMAND_CATEGORIES.EDITOR,
+    context: COMMAND_CONTEXTS.EDITOR,
+    defaultKeybindings: ['Mod+Enter'],
     editorOwned: true,
     configurable: false
   },

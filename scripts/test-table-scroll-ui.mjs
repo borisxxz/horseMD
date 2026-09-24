@@ -4,7 +4,7 @@ import { sleep } from './lib/cdp.mjs'
 import { launchBuiltElectron, stopBuiltElectron } from './lib/electron-test-app.mjs'
 import { typeTextLikeUser } from './lib/human-input.mjs'
 
-const fixture = new URL('./fixtures/table-scroll.md', import.meta.url).pathname
+const fixture = process.env.TABLE_FIXTURE || new URL('./fixtures/table-scroll.md', import.meta.url).pathname
 const port = Number(process.env.CDP_PORT || 9222)
 
 function verifyLayout(result, label) {
@@ -540,6 +540,204 @@ async function verifyFarRightColumnResize(send, evaluate) {
   }
 }
 
+async function verifyUnselectedCellClicksKeepTableScroll(send, evaluate) {
+  const selectors = ['th', 'td']
+  for (const selector of selectors) {
+    const target = await evaluate(`(() => {
+      const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+      const block = rich?.querySelectorAll('.milkdown-table-block')[1]
+      const wrapper = block?.querySelector('.table-wrapper')
+      if (!block || !wrapper) return null
+      block.scrollIntoView({ block: 'center' })
+      wrapper.scrollLeft = wrapper.scrollWidth - wrapper.clientWidth
+      // Move away first so the table is genuinely unselected and its floating
+      // handles/action group are hidden before the cell click.
+      const wrapperRect = wrapper.getBoundingClientRect()
+      const cell = [...block.querySelectorAll('${selector}')].reverse().find((node) => {
+        const rect = node.getBoundingClientRect()
+        return rect.right > wrapperRect.left + 8 && rect.left < wrapperRect.right - 8
+      })
+      const clickable = cell?.querySelector('p') || cell
+      const rect = clickable?.getBoundingClientRect()
+      return rect ? {
+        x: Math.max(wrapperRect.left + 8, Math.min(wrapperRect.right - 8, rect.left + rect.width / 2)),
+        y: rect.top + rect.height / 2,
+        left: wrapper.scrollLeft,
+        text: cell.textContent
+      } : null
+    })()`)
+    if (!target) throw new Error(`desktop: unselected ${selector} click target not found`)
+
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 1, y: 1 })
+    await sleep(180)
+    await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: target.x, y: target.y })
+    await evaluate(`(() => {
+      const trace = []
+      const started = performance.now()
+      const record = () => {
+        const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+        const wrapper = rich?.querySelectorAll('.milkdown-table-block')[1]?.querySelector('.table-wrapper')
+        trace.push(wrapper?.scrollLeft ?? -1)
+        if (performance.now() - started < 250) requestAnimationFrame(record)
+      }
+      window.__hmUnselectedCellTrace = trace
+      requestAnimationFrame(record)
+    })()`)
+    const before = await evaluate(`(() => {
+      const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+      return rich?.querySelectorAll('.milkdown-table-block')[1]?.querySelector('.table-wrapper')?.scrollLeft ?? -1
+    })()`)
+    await send('Input.dispatchMouseEvent', {
+      type: 'mousePressed', x: target.x, y: target.y, button: 'left', buttons: 1, clickCount: 1
+    })
+    await send('Input.dispatchMouseEvent', {
+      type: 'mouseReleased', x: target.x, y: target.y, button: 'left', buttons: 0, clickCount: 1
+    })
+    await sleep(250)
+    const trace = await evaluate('window.__hmUnselectedCellTrace || []')
+    const after = await evaluate(`(() => {
+      const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+      return rich?.querySelectorAll('.milkdown-table-block')[1]?.querySelector('.table-wrapper')?.scrollLeft ?? -1
+    })()`)
+    if (trace.some((left) => left < before - 2) || Math.abs(after - before) > 2) {
+      throw new Error(`desktop: clicking an unselected ${selector} reset table scroll: ${JSON.stringify({ target, before, after, trace })}`)
+    }
+  }
+}
+
+async function verifyFloatingColumnButtonsKeepTableScroll(send, evaluate) {
+  const target = await evaluate(`(() => {
+    const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+    const block = rich?.querySelectorAll('.milkdown-table-block')[1]
+    const wrapper = block?.querySelector('.table-wrapper')
+    if (!block || !wrapper) return null
+    block.scrollIntoView({ block: 'center' })
+    wrapper.scrollLeft = wrapper.scrollWidth - wrapper.clientWidth
+    const wrapperRect = wrapper.getBoundingClientRect()
+    const header = [...block.querySelectorAll('th')].reverse().find((cell) => {
+      const rect = cell.getBoundingClientRect()
+      return rect.right > wrapperRect.left + 8 && rect.left < wrapperRect.right - 8
+    })
+    const rect = header?.getBoundingClientRect()
+    return rect ? {
+      x: Math.max(wrapperRect.left + 8, Math.min(wrapperRect.right - 8, rect.left + rect.width / 2)),
+      y: rect.top + rect.height / 2,
+      left: wrapper.scrollLeft
+    } : null
+  })()`)
+  if (!target) throw new Error('desktop: floating column-button target not found')
+
+  await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: target.x, y: target.y })
+  await sleep(250)
+  const handle = await evaluate(`(() => {
+    const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+    const block = rich?.querySelectorAll('.milkdown-table-block')[1]
+    const handle = block?.querySelector('[data-role="col-drag-handle"]')
+    const rect = handle?.getBoundingClientRect()
+    if (!handle || !rect || handle.dataset.show !== 'true') return null
+    const x = rect.left + rect.width / 2
+    const y = rect.top + rect.height / 2
+    return {
+      x,
+      y,
+      hit: document.elementFromPoint(x, y)?.className || '',
+      hitInside: handle.contains(document.elementFromPoint(x, y))
+    }
+  })()`)
+  if (!handle) throw new Error('desktop: floating column selection button did not appear')
+  if (process.env.TABLE_FLOATING_TRACE === '1') console.log('floating handle:', JSON.stringify(handle))
+
+  const beforeSelect = await evaluate(`(() => {
+    const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+    const wrapper = rich?.querySelectorAll('.milkdown-table-block')[1]?.querySelector('.table-wrapper')
+    return {
+      scrollLeft: wrapper?.scrollLeft ?? -1,
+      scrollWidth: wrapper?.scrollWidth ?? -1,
+      clientWidth: wrapper?.clientWidth ?? -1
+    }
+  })()`)
+  await evaluate(`(() => {
+      const trace = []
+      const scrollEvents = []
+      const started = performance.now()
+      const initialRich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+      const initialWrapper = initialRich?.querySelectorAll('.milkdown-table-block')[1]?.querySelector('.table-wrapper')
+      const onScroll = (event) => {
+        const target = event.target
+        if (target?.matches?.('.table-wrapper')) {
+          scrollEvents.push({ t: Math.round(performance.now() - started), left: target.scrollLeft })
+        }
+      }
+      document.addEventListener('scroll', onScroll, true)
+      const record = () => {
+        const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+        const wrapper = rich?.querySelectorAll('.milkdown-table-block')[1]?.querySelector('.table-wrapper')
+        trace.push({
+          t: Math.round(performance.now() - started),
+          left: wrapper?.scrollLeft ?? -1,
+          sameWrapper: wrapper === initialWrapper,
+          oldConnected: initialWrapper?.isConnected ?? false
+        })
+        if (performance.now() - started < 250) requestAnimationFrame(record)
+      }
+      window.__hmTableFloatingTrace = trace
+      window.__hmTableFloatingScrollEvents = scrollEvents
+      requestAnimationFrame(record)
+    })()`)
+  await send('Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: handle.x, y: handle.y, button: 'left', buttons: 1, clickCount: 1
+  })
+  await send('Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: handle.x, y: handle.y, button: 'left', buttons: 0, clickCount: 1
+  })
+  await sleep(300)
+  const trace = await evaluate(`({ frames: window.__hmTableFloatingTrace || [], events: window.__hmTableFloatingScrollEvents || [] })`)
+  if (process.env.TABLE_FLOATING_TRACE === '1') {
+    console.log('table floating scroll trace:', JSON.stringify(trace))
+  }
+  if (trace.frames.some((sample) => sample.left < beforeSelect.scrollLeft - 2)) {
+    throw new Error(`desktop: clicking the far-right column button visibly changed table scroll: ${JSON.stringify({ beforeSelect, trace })}`)
+  }
+  const afterSelect = await evaluate(`(() => {
+    const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+    const block = rich?.querySelectorAll('.milkdown-table-block')[1]
+    const wrapper = block?.querySelector('.table-wrapper')
+    return {
+      scrollLeft: wrapper?.scrollLeft ?? -1,
+      scrollWidth: wrapper?.scrollWidth ?? -1,
+      clientWidth: wrapper?.clientWidth ?? -1,
+      group: block?.querySelector('[data-role="col-drag-handle"] .button-group')?.dataset.show
+    }
+  })()`)
+  if (Math.abs(afterSelect.scrollLeft - beforeSelect.scrollLeft) > 2 || afterSelect.group !== 'true') {
+    throw new Error(`desktop: clicking the far-right column button reset table scroll: ${JSON.stringify({ beforeSelect, afterSelect })}`)
+  }
+
+  const action = await evaluate(`(() => {
+    const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+    const block = rich?.querySelectorAll('.milkdown-table-block')[1]
+    const button = block?.querySelector('[data-role="col-drag-handle"] .button-group button')
+    const rect = button?.getBoundingClientRect()
+    return rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null
+  })()`)
+  if (!action) throw new Error('desktop: floating column action button did not appear')
+  await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: action.x, y: action.y })
+  await send('Input.dispatchMouseEvent', {
+    type: 'mousePressed', x: action.x, y: action.y, button: 'left', buttons: 1, clickCount: 1
+  })
+  await send('Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x: action.x, y: action.y, button: 'left', buttons: 0, clickCount: 1
+  })
+  await sleep(300)
+  const afterAction = await evaluate(`(() => {
+    const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+    return rich?.querySelectorAll('.milkdown-table-block')[1]?.querySelector('.table-wrapper')?.scrollLeft ?? -1
+  })()`)
+  if (Math.abs(afterAction - beforeSelect.scrollLeft) > 2) {
+    throw new Error(`desktop: clicking the far-right column action reset table scroll: ${JSON.stringify({ beforeSelect, afterAction })}`)
+  }
+}
+
 async function verifyContextMenuKeepsTableScroll(send, evaluate) {
   const target = await evaluate(`(() => {
     const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
@@ -648,7 +846,30 @@ async function verifyTableHandles(send, evaluate) {
       }))
     }
   })()`)
-    if (visible.count && visible.anyVisible) return
+    if (visible.count && visible.anyVisible) {
+      await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 1, y: 1 })
+      await sleep(250)
+      const retained = await evaluate(`(() => {
+        const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+        const block = rich?.querySelectorAll('.milkdown-table-block')[1]
+        const handles = [...(block?.querySelectorAll(':scope > div > .cell-handle') || [])]
+        return handles.map((handle) => ({ role: handle.dataset.role, show: handle.dataset.show }))
+      })()`)
+      if (!retained.length || retained.some((handle) => handle.show !== 'true')) {
+        throw new Error(`desktop: table hover controls disappeared immediately after leaving: ${JSON.stringify(retained)}`)
+      }
+      await sleep(1900)
+      const dismissed = await evaluate(`(() => {
+        const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
+        const block = rich?.querySelectorAll('.milkdown-table-block')[1]
+        return [...(block?.querySelectorAll(':scope > div > .cell-handle') || [])]
+          .map((handle) => ({ role: handle.dataset.role, show: handle.dataset.show }))
+      })()`)
+      if (dismissed.some((handle) => handle.show === 'true')) {
+        throw new Error(`desktop: table hover controls did not dismiss after the two-second grace period: ${JSON.stringify(dismissed)}`)
+      }
+      return
+    }
   }
   if (!visible.count || !visible.anyVisible) {
     throw new Error(`desktop: table handles do not reappear on hover: ${JSON.stringify(visible)}`)
@@ -721,7 +942,7 @@ async function verifyTableActionMenuGrace(send, evaluate) {
   }
 
   await send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 1, y: 1 })
-  await sleep(1550)
+  await sleep(2200)
   const dismissed = await evaluate(`(() => {
     const rich = [...document.querySelectorAll('.ProseMirror')].find((node) => node.offsetParent)
     const handle = rich?.querySelector('.milkdown-table-block [data-role="col-drag-handle"]')
@@ -831,22 +1052,30 @@ async function verifyTableControlBounds(send, evaluate) {
     const editor = rich?.closest('.editor-scroll')
     const block = [...(rich?.querySelectorAll('.milkdown-table-block') || [])].at(-1)
     const group = block?.querySelector('[data-role="row-drag-handle"] .button-group[data-show="true"]')
+    const handle = block?.querySelector('[data-role="row-drag-handle"][data-show="true"]')
+    const wrapper = block?.querySelector('.table-wrapper')
     const bounds = editor?.getBoundingClientRect()
     const blockBounds = block?.getBoundingClientRect()
+    const handleRect = handle?.getBoundingClientRect()
+    const wrapperRect = wrapper?.getBoundingClientRect()
     const rect = group?.getBoundingClientRect()
     const button = group?.querySelector('button')
     const buttonRect = button?.getBoundingClientRect()
     return {
       bounds: bounds?.toJSON(),
       blockBounds: blockBounds?.toJSON(),
+      handle: handleRect?.toJSON(),
+      wrapper: wrapperRect?.toJSON(),
       group: rect?.toJSON(),
       paintRelaxed: block?.classList.contains('hm-table-controls-open'),
       buttonHit: !!button && button.contains(document.elementFromPoint(buttonRect.left + buttonRect.width / 2, buttonRect.top + buttonRect.height / 2))
     }
   })()`)
   if (!row.group || row.group.top < row.bounds.top + 7 || row.group.left < row.bounds.left + 7 ||
-      row.group.right > row.bounds.right - 7 || !row.paintRelaxed || !row.buttonHit) {
-    throw new Error(`desktop: row controls escaped the editor viewport: ${JSON.stringify(row)}`)
+      row.group.right > row.bounds.right - 7 || !row.paintRelaxed || !row.buttonHit ||
+      !row.handle || !row.wrapper || row.handle.right > row.wrapper.left - 1 ||
+      row.group.right > row.wrapper.left - 1) {
+    throw new Error(`desktop: row controls are not outside the table: ${JSON.stringify(row)}`)
   }
 }
 
@@ -928,6 +1157,8 @@ async function main() {
   const app = await launchBuiltElectron({
     profileDir: `/tmp/horsemd-table-scroll-ui-${process.pid}`,
     port,
+    executable: process.env.HORSEMD_EXECUTABLE || undefined,
+    entrypoint: process.env.HORSEMD_ENTRYPOINT ?? undefined,
     appArgs: [fixture]
   })
   const { send, evaluate } = app
@@ -941,6 +1172,18 @@ async function main() {
       mobile: false
     })
     await sleep(1200)
+
+    if (process.env.TABLE_CELL_ONLY === '1') {
+      await verifyUnselectedCellClicksKeepTableScroll(send, evaluate)
+      console.log('table unselected cells: far-right scroll preserved')
+      return
+    }
+
+    if (process.env.TABLE_FLOATING_ONLY === '1') {
+      await verifyFloatingColumnButtonsKeepTableScroll(send, evaluate)
+      console.log('table floating controls: far-right scroll preserved')
+      return
+    }
 
     if (process.env.TABLE_CONTROLS_ONLY === '1') {
       await verifyTableAddButtons(send, evaluate)
@@ -965,6 +1208,7 @@ async function main() {
     await verifyFarRightColumnResize(send, evaluate)
     await verifyTableHandles(send, evaluate)
     await verifyTableActionMenuGrace(send, evaluate)
+    await verifyFloatingColumnButtonsKeepTableScroll(send, evaluate)
     await verifyContextMenuKeepsTableScroll(send, evaluate)
     await verifyTableAddButtons(send, evaluate)
     await verifyTableControlBounds(send, evaluate)

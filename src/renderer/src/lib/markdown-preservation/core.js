@@ -52,6 +52,16 @@ export const rawInsertionAtCanonicalLineEnd = ({
   // stream. At a line end the generic backward mapping lands before them.
   // Advance past syntax, but stay before authored hard-break whitespace.
   const trailingWhitespace = hiddenTail.match(/[ \t]*$/)?.[0] || ''
+
+  // When the canonical line itself ends with whitespace, those bytes are
+  // literal text the serializer kept (the user typed spaces and then kept
+  // typing). The caret sits after them, so the new text must land at the real
+  // source line end. Only source-only trailing whitespace — the authored
+  // hard-break marker the canonical serializer dropped — must be preserved by
+  // inserting before it.
+  const canonicalLineText = previous.slice(previousLine.start, previousLine.end)
+  if (/[ \t]$/.test(canonicalLineText)) return sourceLine.end
+
   return sourceLine.end - trailingWhitespace.length
 }
 
@@ -171,7 +181,27 @@ const translateInlineCanonicalEscapes = (line, restoreFreshPunctuation = false) 
       index + 1 < line.length &&
       markdownEscapePunctuation.test(line[index + 1])
     ) {
-      output += line[index + 1]
+      const restoredChar = line[index + 1]
+      const rest = line.slice(index + 2)
+      // A leading escape is the serializer protecting a *literal* punctuation
+      // character from becoming block syntax (a lone `-`/`*`/`+` line is an
+      // empty bullet item, `#`/`>` start a heading/quote, three backticks open
+      // a fence, a leading `|` starts a table row). Restoring the raw char
+      // there changes document semantics and the integrity check fails
+      // closed. Keep the escape when no visible text precedes it; mid-line
+      // escapes remain plain serializer spelling and are restored.
+      const restoresToBlockSyntax = !hasVisibleTextBefore(index) && (
+        /^[-+*]/.test(restoredChar) && /^(?:\s|$)/.test(rest) ||
+        /^\d/.test(restoredChar) && /^[.)](?:\s|$)/.test(rest) ||
+        /^[#>|]/.test(restoredChar) ||
+        (/^[`~]/.test(restoredChar) && /^[`~]{2}/.test(rest))
+      )
+      if (restoresToBlockSyntax) {
+        output += line[index]
+        index += 1
+        continue
+      }
+      output += restoredChar
       index += 2
       continue
     }
@@ -309,9 +339,23 @@ export const adaptCanonicalRegionToSource = (replacement, source, region) => {
 
 export const isTableLine = (line) => line.includes('|')
 
-export const listMarker = (line) => line.match(/^(\s*)(?:[-+*]|\d{1,9}[.)])\s+/)
+export const listMarker = (line) => line.match(/^(\s*)(?:[-+*]|\d{1,9}[.)])(?=[ \t]+|$)/)
 
+// Identity-keyed cache: during one preserve call the same source/canonical
+// strings are re-lined by every list block's mapper pass (lists.js calls this
+// ~20×). A capped LRU keyed by the string itself turns that O(blocks × doc)
+// re-splitting into one split per distinct string (redis-doc profile:
+// preserveRichMarkdownSource 128s → the line pass alone was 40%+ of it).
+// Line objects are treated as read-only by every caller (verified: no
+// property assignments on them anywhere in markdown-preservation).
+const markdownLinesCache = new Map()
 export const markdownLines = (markdown) => {
+  const cached = markdownLinesCache.get(markdown)
+  if (cached) {
+    markdownLinesCache.delete(markdown)
+    markdownLinesCache.set(markdown, cached)
+    return cached
+  }
   const lines = []
   let start = 0
   while (start <= markdown.length) {
@@ -321,6 +365,10 @@ export const markdownLines = (markdown) => {
     if (next < 0) break
     start = next + 1
   }
+  if (markdownLinesCache.size >= 8) {
+    markdownLinesCache.delete(markdownLinesCache.keys().next().value)
+  }
+  markdownLinesCache.set(markdown, lines)
   return lines
 }
 

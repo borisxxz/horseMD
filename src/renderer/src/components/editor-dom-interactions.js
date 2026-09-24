@@ -2,6 +2,11 @@ import { TextSelection } from '@milkdown/prose/state'
 import { keybindingMatchesEvent } from '../lib/commands/keybinding-normalize.js'
 import { getEffectiveKeybindingMap } from '../lib/commands/keybinding-store.js'
 import { isReadOnlyMutationKey } from './editor-read-only.js'
+import {
+  exitCodeBlockFromDomEvent,
+  topLevelCodeBlockForDom
+} from './editor-code-block-exit.js'
+import { codeMirrorSelectionInfo } from './editor-codemirror-selection.js'
 import { readMermaidCodeSource, refreshMermaidPreviewFromCodeBlock } from './editor-mermaid.js'
 
 export function mountEditorInteractionBindings({
@@ -59,6 +64,69 @@ export function mountEditorInteractionBindings({
     })
   }
 
+  const exitIsolatedEmptyBulletAfterOrdered = (event) => {
+    if (
+      event.key !== 'Backspace' ||
+      event.isComposing ||
+      event.ctrlKey ||
+      event.metaKey ||
+      event.altKey ||
+      event.shiftKey
+    ) return false
+
+    const currentView = viewRef.current || view
+    const state = currentView?.state
+    const selection = state?.selection
+    if (!state || !selection?.empty) return false
+    const { $from } = selection
+
+    // RS-54: ProseMirror's default list keymap joins an isolated empty bullet
+    // into an immediately preceding ordered list, changing its type to the next
+    // ordered number. HorseMD treats Backspace on this exact boundary as
+    // "delete/exit this empty bullet" instead. Keep the guard intentionally
+    // narrow so ordinary list lifting, nested lists, task items and non-empty
+    // bullets continue to use the editor's native keymap.
+    if (
+      $from.depth !== 3 ||
+      $from.parent.type?.name !== 'paragraph' ||
+      $from.parent.content.size !== 0 ||
+      $from.node(1)?.type?.name !== 'bullet_list' ||
+      $from.node(2)?.type?.name !== 'list_item'
+    ) return false
+
+    const list = $from.node(1)
+    const item = $from.node(2)
+    if (
+      list.childCount !== 1 ||
+      item.childCount !== 1 ||
+      item.firstChild?.type?.name !== 'paragraph' ||
+      item.textContent !== '' ||
+      item.attrs?.checked != null
+    ) return false
+
+    const topIndex = $from.index(0)
+    if (topIndex <= 0 || state.doc.child(topIndex - 1)?.type?.name !== 'ordered_list') return false
+
+    const from = $from.before(1)
+    const to = $from.after(1)
+    const nextTop = topIndex + 1 < state.doc.childCount ? state.doc.child(topIndex + 1) : null
+    const paragraphType = state.schema.nodes.paragraph
+    if (!paragraphType) return false
+
+    event.preventDefault()
+    event.stopImmediatePropagation()
+
+    let tr = state.tr.delete(from, to)
+    const reuseNextEmptyParagraph = nextTop?.type === paragraphType && nextTop.content.size === 0
+    if (!reuseNextEmptyParagraph) {
+      tr = tr.insert(from, paragraphType.create())
+    }
+    tr = tr.setSelection(TextSelection.create(tr.doc, Math.min(from + 1, tr.doc.content.size)))
+    currentView.dispatch(tr)
+    onRichEditPending?.(0)
+    return true
+  }
+
   const onKeydown = (event) => {
     noteUserInteraction()
     if (isReadOnly?.()) {
@@ -72,21 +140,20 @@ export function mountEditorInteractionBindings({
       return
     }
     markUserEdit()
-    const codeBlock = event.target.closest?.('.milkdown-code-block')
-    const codeContent = codeBlock?.querySelector('.cm-content')
-    if (event.key === 'Backspace' && codeBlock && codeContent?.textContent === '') {
-      // CodeMirror/Crepe owns this key and can unwrap an empty fenced block
-      // without publishing markdownUpdated before the next fast keystroke.
-      // Reconcile in the next task, after the structural command has applied,
-      // so following prose is never mapped against the stale fenced baseline.
-      setTimeout(() => onRichEditPending?.(0), 0)
+    if (exitIsolatedEmptyBulletAfterOrdered(event)) return
+    const keybindings = getKeybindings?.() || getEffectiveKeybindingMap()
+    const platform = window.api?.platform || (navigator.platform?.toLowerCase().includes('mac') ? 'darwin' : 'win32')
+    if (
+      keybindingMatchesEvent(keybindings['editor.code.exit']?.[0], event, platform) &&
+      exitCodeBlockFromDomEvent({ event, view: viewRef.current || view })
+    ) {
+      onRichEditPending?.()
+      return
     }
     if (!event.ctrlKey && !event.metaKey && !event.altKey &&
       (event.key === ' ' || event.code === 'Space')) {
       noteListInputRuleIntent()
     }
-    const keybindings = getKeybindings?.() || getEffectiveKeybindingMap()
-    const platform = window.api?.platform || (navigator.platform?.toLowerCase().includes('mac') ? 'darwin' : 'win32')
     if (keybindingMatchesEvent(keybindings['editor.block.paragraph']?.[0], event, platform)) {
       event.preventDefault()
       setBlock('paragraph')
@@ -163,11 +230,37 @@ export function mountEditorInteractionBindings({
         }
         const domSelection = currentView.dom.ownerDocument.getSelection()
         let preservedTextSelection = false
+        // CodeMirror owns its DOM selection and ProseMirror can therefore keep
+        // a stale selection in a neighbouring paragraph. Before a block action
+        // runs, bridge a collapsed caret only when it belongs to the exact code
+        // block that received this context-menu event.
+        const clickedCodeBlock = event.target.closest?.('.milkdown-code-block') || null
+        if (clickedCodeBlock && currentView.dom.contains(clickedCodeBlock)) {
+          const match = topLevelCodeBlockForDom(currentView, clickedCodeBlock)
+          if (match) {
+            const codeSelection = domSelection?.isCollapsed
+              ? codeMirrorSelectionInfo(currentView, domSelection)
+              : null
+            const local = codeSelection?.blockPos === match.offset
+              ? codeSelection.local
+              : 0
+            const pmPos = match.offset + 1 + Math.max(
+              0,
+              Math.min(local, match.node.content.size)
+            )
+            currentView.dispatch(currentView.state.tr.setSelection(
+              TextSelection.create(currentView.state.doc, pmPos)
+            ))
+            blockPos = pmPos
+            blockListConvertible = false
+            preservedTextSelection = true
+          }
+        }
         // ProseMirror normally syncs DOM selection changes immediately. A
         // context-menu event can race that sync on macOS/Windows, though. Read
         // the browser's selected range once here and commit it to editor state
         // before opening actions that depend on it.
-        if (domSelection && !domSelection.isCollapsed &&
+        if (!preservedTextSelection && domSelection && !domSelection.isCollapsed &&
           currentView.dom.contains(domSelection.anchorNode) &&
           currentView.dom.contains(domSelection.focusNode)) {
           try {
@@ -211,13 +304,13 @@ export function mountEditorInteractionBindings({
     // The view update and its node-view DOM work can span two animation frames.
     // Restore twice rather than using a fixed timeout, and only for the table
     // that received this context menu.
-    requestAnimationFrame(() => {
+    let restoreFrames = 0
+    const restoreAcrossLayout = () => {
       restoreTableScroll()
-      requestAnimationFrame(() => {
-        restoreTableScroll()
-        requestAnimationFrame(restoreTableScroll)
-      })
-    })
+      restoreFrames += 1
+      if (restoreFrames < 8) requestAnimationFrame(restoreAcrossLayout)
+    }
+    requestAnimationFrame(restoreAcrossLayout)
   }
   const onSelectionChange = () => {
     const currentView = viewRef.current

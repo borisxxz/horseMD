@@ -17,10 +17,39 @@
 | [rich-source-fidelity-bug-family.md](./rich-source-fidelity-bug-family.md) | 富文本编辑、模式切换、保存重开、列表、空段落与转义问题的家族总账和发布前回归合同 |
 | [family-root-cause-matrix.md](./family-root-cause-matrix.md) | 真实文件 4×5 家族矩阵、多轮保存重开根因、CRLF/尾换行/列表原子提交证据 |
 | [rich-source-divergence-incident-0.13.47.md](./rich-source-divergence-incident-0.13.47.md) | **P0 未解决**：0.13.47 自动化全绿但安装包真实长会话仍发生富文本/源码/磁盘分叉；含现场证据、测试缺口、统一 trace 要求与接手完成标准 |
-| [transaction-source-sync-architecture.md](./transaction-source-sync-architecture.md) | 方案一：保留 ProseMirror，以事务直接更新作者源码；含影子/接管状态机、空块事故与放行门槛 |
+| [transaction-source-sync-architecture.md](./transaction-source-sync-architecture.md) | **当前架构状态（0.13.149）**：revision-bound transaction journal、stable descendant path、structural owner registry、共享 list/code/quote/table/plain 生命周期与剩余结构族迁移门槛 |
+| [source-rich-consistency-completion-plan.md](./source-rich-consistency-completion-plan.md) | **最终收口路线图**：从 0.13.148 检查点、剩余 owner、legacy 退役、普通段落 authority、特殊入口到安装包长会话 P0 关闭的阶段、门禁和 Definition of Done |
+| [transaction-journal-code-block-content-family.md](./transaction-journal-code-block-content-family.md) | 0.13.133 已有 fenced code block 正文迁移：逐 Step 所有权、BOM 物理坐标、作者围栏/CRLF 保真、callback/forced-flush 与冷重开证据 |
+| [transaction-journal-code-block-info-family.md](./transaction-journal-code-block-info-family.md) | 0.13.134 已有 fenced code block 语言 info string 迁移：AttrStep 所有权、opening info 物理范围、作者 padding/BOM/CRLF 保真与真实语言选择器双路径证据 |
+| [transaction-journal-code-block-exit.md](./transaction-journal-code-block-exit.md) | 0.13.148 非空 fenced code block 的 Mod+Enter显式退出：exact exitCode Step、pending/coalesced/staged provenance、bounded段落插入与三条真实持久化路径 |
+| [transaction-journal-empty-code-block-backspace.md](./transaction-journal-empty-code-block-backspace.md) | 0.13.146 空 fenced code block Backspace 解包迁移：完整 node ReplaceStep、同 journal 快速正文、forced-empty、作者围栏/BOM/CRLF 保真与冷重开证据 |
+| [transaction-journal-code-block-legacy-owner-retirement.md](./transaction-journal-code-block-legacy-owner-retirement.md) | 已接线代码块 family 的 legacy owner 退役矩阵：正文 dedicated mapper 删除、info/unpack/exit generic fallback 阻断、recognition边界与负向 fence-collision 证据 |
+| [transaction-journal-empty-code-list-paragraph-families.md](./transaction-journal-empty-code-list-paragraph-families.md) | 0.13.147 顶层 list-item plain paragraph raw owner、RS-72 exact PM path transient抑制及空代码块相邻生命周期门禁 |
+| [transaction-journal-blockquote-paragraph-family.md](./transaction-journal-blockquote-paragraph-family.md) | 0.13.135–0.13.136 已有 blockquote 同一直接子段落纯文字迁移：stable descendant path、作者 quote 前缀/BOM/CRLF 保真、callback/forced-flush、保存与冷重开证据 |
+| [transaction-journal-blockquote-split-family.md](./transaction-journal-blockquote-split-family.md) | 0.13.136 blockquote 中间 Enter 拆段迁移：nested-list PM nodePath、结构 Step 链、单行 bounded raw patch、歧义拒绝与真实双边界持久化证据 |
+| [transaction-journal-blockquote-join-family.md](./transaction-journal-blockquote-join-family.md) | 0.13.137 blockquote 段首 Backspace join 迁移：真实 structure true/false ReplaceStep、quote separator bounded patch、nested path 与 callback/forced-flush 持久化证据 |
+| [transaction-journal-blockquote-exit-family.md](./transaction-journal-blockquote-exit-family.md) | 0.13.138 blockquote 末尾双 Enter exit 迁移：pending/coalesced/staged journal、ReplaceAroundStep、parent/quote/inserted paths、bounded raw insertion 与三种真实持久化路径 |
+| [transaction-journal-blockquote-legacy-owner-retirement.md](./transaction-journal-blockquote-legacy-owner-retirement.md) | 0.13.149 四个已迁移 Blockquote family 的 recognition边界、generic legacy fallback阻断、真实语法敏感负例与未迁移兼容门禁 |
+| [transaction-journal-table-cell-family.md](./transaction-journal-table-cell-family.md) | 0.13.139 GFM table 单一 cell 纯文字迁移：stable cell path、重复 occurrence、bounded source-map patch、callback/forced-flush 与持久化证据 |
+| [transaction-journal-table-row-delete-family.md](./transaction-journal-table-row-delete-family.md) | 0.13.140 GFM table 单 body-row 删除迁移：real deleteRow Step、exact row range、重复 row occurrence、raw physical-line deletion 与真实控件持久化证据 |
+| [transaction-journal-table-row-insert-family.md](./transaction-journal-table-row-insert-family.md) | 0.13.141 GFM table 单空 body-row 新增迁移：real addRowAfter Step、exact insertion boundary、作者行模板、三种 EOL/EOF 与真实控件持久化证据 |
+| [transaction-journal-table-column-delete-family.md](./transaction-journal-table-column-delete-family.md) | 0.13.142 GFM simple-grid 单列删除迁移：real deleteColumn 多 Step/stepDoc、唯一 column ordinal、header/delimiter/body bounded edits 与双路径持久化证据 |
+| [transaction-journal-table-column-insert-family.md](./transaction-journal-table-column-insert-family.md) | 0.13.143 GFM simple-grid 空列新增迁移：real addColumn 多 Step/stepDoc、唯一 column ordinal、alignment attrs、header/delimiter/body bounded insertions 与双路径持久化证据 |
+| [transaction-journal-table-column-alignment-family.md](./transaction-journal-table-column-alignment-family.md) | 0.13.144 GFM simple-grid 整列对齐迁移：real CellSelection + ReplaceAroundStep/stepDoc、delimiter-only raw patch、left/center/right 双边界持久化证据 |
+| [transaction-journal-table-column-width-family.md](./transaction-journal-table-column-width-family.md) | 0.13.145 表格物理列宽元数据迁移：真实拖拽逐 row ReplaceAroundStep、exact path-bound semantic proof、source/canonical 不变、callback/forced-flush 与冷重开边界 |
+| [transaction-first-source-sync-phase1-plain-paragraph-plan.md](./transaction-first-source-sync-phase1-plain-paragraph-plan.md) | Phase 1 普通段落 authority 的分类器、shadow/authority 合同、当前未完成门禁与回归证据 |
 | [slash-code-source-sync-regression.md](./slash-code-source-sync-regression.md) | `/code` 两阶段结构命令缺失 fence 的根因、命令级原子 source intent 与连续编辑回归 |
 | [canonical-escape-audit.md](./canonical-escape-audit.md) | canonical Markdown 中实体、反斜杠、列表标记与 `<br />` 的完整泄漏面审计 |
 | [nested-list-sync-bug-handoff.md](./nested-list-sync-bug-handoff.md) | `- 1. 内容`、多列表批次、marker 保留与列表结构分歧的根因和回归矩阵 |
+| [generated-scratch-empty-ordered-indent-regression.md](./generated-scratch-empty-ordered-indent-regression.md) | RS-45：新建文档空 `2.` 按 Tab 后，generated scratch 误删空嵌套项重解析所需空行，导致合法结构被 integrity gate 拒绝 |
+| [diverged-nested-number-enter-split-regression.md](./diverged-nested-number-enter-split-regression.md) | RS-46：`- 1. 文本` 行内嵌套 ordered item 经 Enter 拆项后，新 sibling 被错误写成新的外层 bullet |
+| [empty-blockquote-ime-fill-regression.md](./empty-blockquote-ime-fill-regression.md) | RS-48：空 blockquote 中 IME 提交正文时，尾部空块 mapper 把 quoted text 错写成引用块外普通段落；0.13.94 原位填充 quote slot |
+| [generated-scratch-literal-ordered-ime-regression.md](./generated-scratch-literal-ordered-ime-regression.md) | RS-49：新文档 bullet 正文开头 `1\\.` 被 generated scratch 去转义后重解析成 nested ordered list；0.13.95 保留结构保护 escape |
+| [appended-literal-ordered-marker-regression.md](./appended-literal-ordered-marker-regression.md) | RS-55：尾部普通段输入字面 `3.` 时，appended paragraph 过早去掉结构保护反斜杠；0.13.101 仅保护整块 `N\\.` / `N\\)` |
+| [generated-scratch-nested-empty-backspace-regression.md](./generated-scratch-nested-empty-backspace-regression.md) | RS-56：三级 nested bullet 最深项快速双 Backspace 时 raw `<br />` 缩进证据被 normalize 抹掉；0.13.102 以 raw canonical 窄证明 nested list-item removal |
+| [generated-scratch-blockquote-empty-paragraph-regression.md](./generated-scratch-blockquote-empty-paragraph-regression.md) | RS-57：引用正文末尾 Enter 产生无法直接用 Markdown 持久化的空第二段；0.13.103 用专用 transient proof 保持源码不变直到该段收到正文 |
+| [generated-scratch-task-continuation-empty-regression.md](./generated-scratch-task-continuation-empty-regression.md) | RS-58：checked task/list item 内尾随 continuation paragraph 删空时，raw `<br />` 缩进 ownership 被 normalize 丢失；0.13.104 用专用 list transient proof 保持源码、保存和冷重开一致 |
+| [escaped-standalone-paragraph-expand-regression.md](./escaped-standalone-paragraph-expand-regression.md) | RS-59：已有 source/canonical 拼写分歧时，中间空段的字面 `\\-` 扩写为 `-【】` 会因 visible-offset 零宽边界粘到上一段；0.13.105 用 mapped source line identity fail-closed 到行级 mapper |
 | [backtick-source-sync-lock-regression.md](./backtick-source-sync-lock-regression.md) | 反引号输入/删除、行内代码闭合、代码围栏退出、保存暂停与源码锁死的联合回归 |
 | [list-item-literal-marker-escape-regression.md](./list-item-literal-marker-escape-regression.md) | 列表正文中 `1.`、`1)`、`-`、`+`、`*` 字面文本被错误转义的根因与修复 |
 | [desktop-drop-open.md](./desktop-drop-open.md) | 桌面端从 Finder / 文件资源管理器拖入文件或文件夹的产品边界、IPC 与测试合同 |
@@ -48,6 +77,7 @@
 | [mobile-usage.md](./mobile-usage.md) | 移动端**使用说明**(安装、界面、保存/导出等操作) |
 | [user-guide-maintenance.md](./user-guide-maintenance.md) | 面向用户的图文教程站、截图与发布维护规范 |
 | [user-guide-feature-coverage.md](./user-guide-feature-coverage.md) | 用户可见功能、代码所有者、教程页面与发布前核对状态矩阵 |
+| [release-v0.13.187.md](./release-v0.13.187.md) | v0.13.187 发布说明：事务证据链一致性收口、HTML 表格公式渲染、微信列表复制、云同步表单、标签滚轮与安装产物 |
 | [release-v0.13.29.md](./release-v0.13.29.md) | v0.13.29 发布说明、安装产物、完整原文保真验证与关联 Issue |
 | [release-v0.12.46.md](./release-v0.12.46.md) | v0.12.46 发布说明、安装产物、验证记录与关联 Issue |
 | [release-v0.12.47.md](./release-v0.12.47.md) | v0.12.47 紧急修复发布说明、跨编辑器核验与安装产物 |
@@ -70,7 +100,7 @@
 | [issue-86-table-save-report.md](./issue-86-table-save-report.md) | 表格增删行列后的单元格归属、空单元格与保存重开回归 |
 | [issues-93-98-implementation-report.md](./issues-93-98-implementation-report.md) | issue 93/96/97/98 的实现与验收记录 |
 | [codeblock-fence-investigation.md](./codeblock-fence-investigation.md) | **进行中**：代码块围栏「吞正文」排查留底（解析机制已确认，正常路径未复现，待用户提供步骤） |
-| [live-preview-migration-plan.md](./live-preview-migration-plan.md) | 远期「源码即数据模型」Live Preview 独立架构迁移计划（不可作为 Crepe 模式切换小修） |
+| [live-preview-migration-plan.md](./live-preview-migration-plan.md) | 长期「源码即数据模型」Live Preview 终局方案；当前先执行 transaction-first 分类型迁移，不启动全量替换 |
 | [macos-real-input-testing.md](./macos-real-input-testing.md) | macOS CGEvent 前台逐键输入的真实测试方法（疑难编辑问题的补充手段） |
 | [list-conversion-prd.md](./list-conversion-prd.md) | 有序/无序/待办列表相互转换的产品范围与验收标准 |
 | [floating-outline-design.md](./floating-outline-design.md) | 右侧悬浮大纲（Scroll Spy 圆点导航）设计与实现边界 |

@@ -9,6 +9,7 @@ import {
   materializeCopiedSoftBreaks
 } from './editor-copy.js'
 import { attachMdPasteHandler } from './editor-md-paste.js'
+import { attachPlainTextDropHandler } from './editor-drop-text.js'
 import { hasStructuredWebHtml } from './editor-web-paste.js'
 
 export function mountEditorContentBindings({
@@ -51,8 +52,18 @@ export function mountEditorContentBindings({
       const wrapper = document.createElement('div')
       wrapper.appendChild(fragment)
       materializeCopiedSoftBreaks(wrapper)
+      // A mid-list selection clones <li> without its list wrapper. Whether the
+      // items were ordered is only visible in the LIVE dom — inspect it before
+      // styling so the re-wrapped clipboard fragment keeps its numbering.
+      const selectionOrderedLists = Boolean(
+        selection.anchorNode?.parentElement?.closest('ol') ||
+        selection.focusNode?.parentElement?.closest('ol')
+      )
+      inlineRichStyles(wrapper, { selectionOrderedLists })
+      // Plain text must be derived AFTER the clipboard transform: Milkdown's
+      // in-item marker span ("1.") becomes its own line in the raw clone, so
+      // text-only paste targets showed the number split from its text.
       const plain = copiedPlainText(wrapper, selection.toString())
-      inlineRichStyles(wrapper)
       let serialized = ''
       if (!view.state.selection.empty) {
         try {
@@ -215,6 +226,11 @@ export function mountEditorContentBindings({
       }
     }, prepareRawMarkdownPaste, markUserEdit)
   )
+  // Plain-text drops insert literal text at the drop point — without this,
+  // ProseMirror's html-flavored block insertion splits the host textblock
+  // (trace-61614: a `<br />` drop split a list item into [empty, text] and
+  // spawned unround-trippable empty blocks → source-sync warning).
+  cleanups.push(attachPlainTextDropHandler(view, markUserEdit))
   cleanups.push(() => view.dom.removeEventListener('click', onLinkClick, true))
   cleanups.push(() => view.dom.removeEventListener('click', onImageClick, true))
   cleanups.push(() => view.dom.removeEventListener('click', onMermaidClick, true))

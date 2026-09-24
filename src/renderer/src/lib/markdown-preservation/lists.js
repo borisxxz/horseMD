@@ -33,7 +33,7 @@ export const listBlockAt = (markdown, offset, { splitBulletMarkers = false } = {
   }
   if (markerIndex < 0) return null
 
-  const baseLineMarker = lines[markerIndex].text.match(/^(\s*)([-+*]|\d{1,9}[.)])\s+/)
+  const baseLineMarker = lines[markerIndex].text.match(/^(\s*)([-+*]|\d{1,9}[.)])(?=[ \t]+|$)/)
   const baseIndent = baseLineMarker[1].length
   const baseToken = baseLineMarker[2]
   const baseKind = /^\d/.test(baseToken) ? 'ordered' : 'bullet'
@@ -44,7 +44,7 @@ export const listBlockAt = (markdown, offset, { splitBulletMarkers = false } = {
     if (!marker) return indent > baseIndent
     if (indent > baseIndent) return true
     if (indent < baseIndent) return false
-    const token = line.text.match(/^\s*([-+*]|\d{1,9}[.)])\s+/)?.[1] || ''
+    const token = line.text.match(/^\s*([-+*]|\d{1,9}[.)])(?=[ \t]+|$)/)?.[1] || ''
     const kind = /^\d/.test(token) ? 'ordered' : 'bullet'
     // Markdown parsers commonly canonicalize `-`, `+` and `*` into one
     // bullet-list node. In authored source they can still be intentionally
@@ -93,6 +93,91 @@ const listBlockNear = (markdown, ...offsets) => {
   return null
 }
 
+// Return only the list ITEM rooted at the marker owning `offset`, including
+// indented continuation/nested rows but never a same-or-shallower sibling.
+// This is deliberately narrower than listBlockAt: an escaped standalone marker
+// (`\\-`) gives us exact source-row ownership, so replacing the surrounding
+// loose list would duplicate already-authored siblings.
+const listItemAt = (markdown, offset) => {
+  const lines = markdownLines(markdown)
+  let index = lineIndexAt(lines, offset)
+  if (index < 0) return null
+  let markerIndex = -1
+  for (let current = index; current >= 0; current -= 1) {
+    if (listMarker(lines[current].text)) {
+      markerIndex = current
+      break
+    }
+    if (lines[current].text.trim() && !/^\s+/.test(lines[current].text)) return null
+  }
+  if (markerIndex < 0) return null
+  const rootMatch = lines[markerIndex].text.match(/^(\s*)([-+*]|\d{1,9}[.)])(?=[ \t]+|$)/)
+  if (!rootMatch) return null
+  const rootIndent = rootMatch[1].length
+  let endIndex = markerIndex
+  for (let current = markerIndex + 1; current < lines.length; current += 1) {
+    const line = lines[current]
+    if (!line.text.trim()) continue
+    const marker = listMarker(line.text)
+    const indent = line.text.match(/^\s*/)?.[0]?.length || 0
+    if (marker) {
+      if (indent <= rootIndent) break
+      endIndex = current
+      continue
+    }
+    if (indent <= rootIndent) break
+    endIndex = current
+  }
+  return {
+    start: lines[markerIndex].start,
+    end: lines[endIndex].end,
+    indent: rootIndent,
+    token: rootMatch[2]
+  }
+}
+
+// A physical Space input rule can remap the pre-Space PM position into the
+// PREVIOUS sibling once the literal paragraph becomes a list item. Therefore
+// canonicalOffset is not authoritative for an already-published `\\-`. The
+// previous canonical still contains that literal marker, though, and its
+// visible position identifies its occurrence even when several `\\-` lines
+// exist. Count same-indent bullet rows before that literal; after Space the new
+// item occupies exactly that ordinal among same-indent bullets.
+const bulletItemFromOwnedLiteralTransition = ({
+  source,
+  sourceLine,
+  previous,
+  next,
+  marker
+}) => {
+  const sourceVisible = sourceVisiblePositionAtRaw(source, sourceLine.start).visibleIndex
+  const previousLines = markdownLines(previous)
+  const literalCandidates = previousLines
+    .map((line) => {
+      const match = line.text.match(/^(\s*)\\([-+*])$/)
+      if (!match || match[2] !== marker) return null
+      const visible = sourceVisiblePositionAtRaw(previous, line.start).visibleIndex
+      return { line, match, distance: Math.abs(visible - sourceVisible) }
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.distance - right.distance)
+  if (!literalCandidates.length) return null
+  if (literalCandidates[1]?.distance === literalCandidates[0].distance) return null
+  const literal = literalCandidates[0]
+  const indent = literal.match[1].length
+  const bulletsBefore = previousLines.filter((line) => {
+    if (line.start >= literal.line.start) return false
+    const match = line.text.match(/^(\s*)([-+*])(?=[ \t]+|$)/)
+    return Boolean(match && match[1].length === indent)
+  }).length
+  const nextBullets = markdownLines(next).filter((line) => {
+    const match = line.text.match(/^(\s*)([-+*])(?=[ \t]+|$)/)
+    return Boolean(match && match[1].length === indent)
+  })
+  const targetLine = nextBullets[bulletsBefore]
+  return targetLine ? listItemAt(next, targetLine.start) : null
+}
+
 // The list tree that CONTAINS `offset` at the top level (indent 0). Crepe
 // serializes each authored top-level row as a `* ` wrapper plus nested rows;
 // an edit inside a nested row must be attributed to that whole wrapper block
@@ -125,7 +210,8 @@ const flatListItemRows = (blockText) => {
       return {
         indent: match[1].length,
         token: match[2],
-        text: String(match[3] || '').replace(/<br\s*\/?>\s*$/i, '').trim()
+        text: String(match[3] || '').replace(/<br\s*\/?>\s*$/i, '').trim(),
+        raw: line
       }
     }
     const continuation = line.match(/^(\s+)(\S.*)$/)
@@ -133,7 +219,8 @@ const flatListItemRows = (blockText) => {
     return {
       indent: continuation[1].length,
       token: '',
-      text: continuation[2].trim()
+      text: continuation[2].trim(),
+      raw: line
     }
   })
   const rows = []
@@ -145,7 +232,17 @@ const flatListItemRows = (blockText) => {
       if (follower && follower.indent > row.indent) continue
 
     }
-    rows.push({ token: row.token, text: row.text, indent: row.indent })
+    // A continuation row separated by a blank line is its own PARAGRAPH inside
+    // the item (remark-stringify's loose-item spelling); a single newline is a
+    // lazy/soft continuation of the same paragraph. The authored-source patch
+    // must replicate that separator or the row re-parses as one paragraph.
+    rows.push({
+      token: row.token,
+      text: row.text,
+      indent: row.indent,
+      raw: row.raw,
+      blankBefore: i > 0 && parsed[i - 1] === null
+    })
   }
   return rows
 }
@@ -162,14 +259,18 @@ const sourceListItemRows = (blockText) => {
     const rawLine = rawLines[index]
     const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
     const breakEnd = lineStart + rawLine.length + (index < rawLines.length - 1 ? 1 : 0)
-    const match = line.match(/^(\s*)([-+*]|\d{1,9}[.)])\s+(.*)$/)
+    // A bare empty item (`1.`, `-`) is a real authored row: remark parses it
+    // as an empty list item, and the fingerprint already counts it as one
+    // empty slot. The marker space is optional, so parse both spellings and
+    // report the empty text with its content boundary after the marker.
+    const match = line.match(/^(\s*)([-+*]|\d{1,9}[.)])(?:[ \t]+(.*))?$/)
     if (match) {
       if (baseIndent == null) baseIndent = match[1].length
       rows.push({
         start: lineStart,
         end: lineStart + line.length,
         breakEnd,
-        contentStart: lineStart + match[1].length + match[2].length + 1,
+        contentStart: lineStart + match[1].length + match[2].length + (match[3] != null ? 1 : 0),
         indent: match[1].length,
         token: match[2],
         text: String(match[3] || '')
@@ -307,9 +408,19 @@ export const preserveGeneratedBulletMarkers = (source, markdown) => {
     const uninterruptedFromPrevious = previous &&
       previous.indent === nextIndent &&
       /^(?:\r?\n)$/.test(markdown.slice(previous.end, nextLine.start))
+    // A nested EMPTY marker row is serialized with one structural blank line
+    // before it (RS-64: CommonMark reads a bare nested marker as continuation
+    // text without that separator). The Tab-sink inheritance must accept that
+    // separator too, or it is dead code for exactly its target shape — the
+    // new empty nested row — and a typed `-` leaks Crepe's `*` (0.13.183
+    // trace 12:33:45).
+    const separatorFromPrevious = previous
+      ? markdown.slice(previous.end, nextLine.start)
+      : ''
     const newlyNestedFromPrevious = previous &&
       previous.indent < nextIndent &&
-      /^(?:\r?\n)$/.test(markdown.slice(previous.end, nextLine.start))
+      (/^(?:\r?\n)$/.test(separatorFromPrevious) ||
+        /^\r?\n\r?\n$/.test(separatorFromPrevious))
     // Tab creates a child bullet list without a literal `-`/`+` input token,
     // so there is no input-rule intent to restore.  While the child has no
     // authored source row yet, inherit its parent bullet spelling rather than
@@ -317,6 +428,39 @@ export const preserveGeneratedBulletMarkers = (source, markdown) => {
     // explicit nested `+`/`-` captured by an input rule must remain explicit.
     if (!preserveMarker && nextMarker === '*' && (uninterruptedFromPrevious || newlyNestedFromPrevious)) {
       preserveMarker = compatibleMarker(previous.marker, nextMarker)
+    }
+    // Enter at the end of a nested item exits to a NEW EMPTY row at a
+    // SHALLOWER indent (e.g. `  * child` → new top-level empty bullet). The
+    // previous sibling is deeper, so neither inheritance above applies and a
+    // typed `-` used to flicker to the serializer default `*` until the next
+    // edit re-matched by text. The new row is still empty and carries no
+    // text anchor of its own; inherit the authored spelling of the nearest
+    // PRECEDING canonical row at the SAME indent (looking it up by position
+    // in the source list). Inheritance reads the spelling only — the source
+    // row is NOT consumed, because its text-matched counterpart already used
+    // it and the spelling legitimately describes the whole level.
+    if (!preserveMarker && nextMarker === '*' && !listText(nextLine).trim()) {
+      for (let back = index - 1; back >= 0; back -= 1) {
+        const backLine = nextLines[back]
+        if (!backLine) break
+        const backIndent = backLine.match[1].length
+        if (backIndent > nextIndent) continue
+        if (backIndent < nextIndent) break
+        // The nearest same-indent canonical row's authored spelling — find it
+        // in the source by exact text (this row was proven to exist above us
+        // with a stable spelling), else by the last source row at this indent.
+        const backText = listText(backLine)
+        const byText = sourceByText
+          .get(`${nextIndent} ${backText}`)
+          ?.find((candidate) => candidate.match[1].length === nextIndent)
+        const sameLevelSource = byText ||
+          sourceLines.filter((candidate) => candidate.match[1].length === nextIndent).at(-1)
+        if (sameLevelSource) {
+          const inherited = compatibleMarker(sameLevelSource.match[2], nextMarker)
+          if (inherited) preserveMarker = inherited
+        }
+        break
+      }
     }
     if (preserveMarker && preserveMarker !== nextMarker) {
       replacements.push({
@@ -366,15 +510,40 @@ export const normalizeEmptyListItems = (markdown) => String(markdown || '')
   // recognize the placeholder.
   .replace(/^[ \t]*<br\s*\/?>[ \t]*$/gim, '<br />')
 
+// Crepe does not reliably retain the ordered-list delimiter (`1.` vs `1)`)
+// across structural edits: removing an empty ordered item can re-serialize a
+// FOLLOWING ordered list's markers from `1)` to `1.` in the same transaction.
+// That serializer-only flip inflates the common-change span so the following
+// list's text is treated as edited content, which used to make the
+// empty-item-removed mapper fail its guard and let the empty-list-fill mapper
+// replace the whole list block (deleting the following list). The authored
+// delimiter lives in the source and is carried forward by the list mappers,
+// so normalizing it here — line-start ordered markers only, never literal
+// text, and length-preserving — makes the diff see only the real edit.
+export const normalizeOrderedListDelimiters = (markdown) => String(markdown || '')
+  .replace(/^([ \t]*)(\d{1,9})[.)](?=[ \t]|$)/gm, '$1$2.')
+
 // Rich-text-created documents have no authored list spacing to preserve yet.
-// Crepe can transiently serialize a newly indented item as a loose list
-// (`2. item\n\n   1. child`) when several keyboard transactions are batched.
-// Generate the compact Markdown users expect from incremental typing, without
-// touching existing source documents where that blank line may be intentional.
+// Crepe can transiently serialize a newly indented NON-EMPTY item as a loose
+// list (`2. item\n\n   1. child`) when several keyboard transactions are
+// batched. Generate the compact Markdown users expect from incremental typing.
+//
+// An EMPTY nested item is different: `1. parent\n   1. ` is not parsed back as
+// a nested ordered list by remark; it becomes a hard break plus literal `1.` in
+// the parent paragraph. Crepe serializes that editor state as
+// `1. parent\n\n   1. <br />`. After normalizeEmptyListItems removes the
+// editor-only `<br />`, the blank line is still structural authored Markdown and
+// must remain. Only preserve that separator when the next row is both deeper
+// and empty; same-level empty rows and non-empty nested rows remain compact.
 export const compactGeneratedListSpacing = (markdown) => String(markdown || '')
   .replace(
-    /(^[ \t]*(?:[-+*]|\d{1,9}[.)])\s+[^\n]*)\n(?:[ \t]*\n)+(?=[ \t]*(?:[-+*]|\d{1,9}[.)])\s+)/gm,
-    '$1\n'
+    /(^([ \t]*)(?:[-+*]|\d{1,9}[.)])[ \t]+[^\n]*)\n(?:[ \t]*\n)+(?=([ \t]*)(?:[-+*]|\d{1,9}[.)])([ \t]+)([^\n]*))/gm,
+    (match, currentLine, currentIndent, nextIndent, _markerSpacing, nextBody) => {
+      const nestedEmptyItem =
+        nextIndent.length > currentIndent.length &&
+        String(nextBody || '').trim() === ''
+      return nestedEmptyItem ? match : `${currentLine}\n`
+    }
   )
 
 // Before the space is accepted, Markdown's list input rule is represented as a
@@ -403,12 +572,45 @@ export const preserveTypedBulletInputRule = ({
   const normalizedCanonical = normalizeEmptyListItems(canonical)
   const previous = normalizeEmptyListItems(String(previousCanonical || ''))
   const change = commonChange(previous, normalizedCanonical)
-  // `markdownUpdated` can be deferred while a person continues typing. By the
-  // time it arrives, the live selection may already be inside a nested list.
-  // The input-rule intent belongs to the *first list introduced by this delta*,
-  // never whichever nested list happens to own the current caret.
-  const canonicalList = listBlocksInSourceOrder(normalizedCanonical)
-    .find((block) => block.start >= change.start && block.end <= change.nextEnd) ||
+
+  // Strongest ownership proof: the previous dash callback has already written
+  // an exact standalone escaped marker (`\\-`, `\\*`, `\\+`) into source. In
+  // that case the captured PM/canonical offset owns ONE list item, not the
+  // entire loose list block around it. Crepe can serialize an older sibling
+  // list and this new empty item as one canonical list; rebuilding that whole
+  // block here duplicated the siblings in the real human Enter→Enter→'-'→Space
+  // sequence. Isolate only the item rooted at the captured offset.
+  let ownedSourceLine = null
+  if (Number.isFinite(sourceOffset)) {
+    const sourceLine = lineAt(source, sourceOffset)
+    const sourceMatch = source.slice(sourceLine.start, sourceLine.end).match(
+      isBullet
+        ? /^([ \t]*)\\([-+*])$/
+        : /^([ \t]*)(\d{1,9}[.)])$/
+    )
+    if (sourceMatch?.[2] === marker) ownedSourceLine = sourceLine
+  }
+  const ownedCanonicalItem = ownedSourceLine && isBullet
+    ? bulletItemFromOwnedLiteralTransition({
+        source,
+        sourceLine: ownedSourceLine,
+        previous,
+        next: normalizedCanonical,
+        marker
+      })
+    : null
+  if (ownedSourceLine && isBullet && (
+    !ownedCanonicalItem ||
+    !/^[-+*]$/.test(ownedCanonicalItem.token) ||
+    ownedCanonicalItem.end < change.start || ownedCanonicalItem.start > change.nextEnd
+  )) return null
+
+  // Without exact escaped-bullet ownership, retain the established deferred-
+  // batch behavior (including ordered lists): the first list introduced by the
+  // delta wins over a potentially stale live caret.
+  const canonicalList = ownedCanonicalItem ||
+    listBlocksInSourceOrder(normalizedCanonical)
+      .find((block) => block.start >= change.start && block.end <= change.nextEnd) ||
     listBlockAt(normalizedCanonical, canonicalOffset)
   if (!canonicalList) return null
   const canonicalLine = lineAt(normalizedCanonical, canonicalList.start)
@@ -417,28 +619,18 @@ export const preserveTypedBulletInputRule = ({
   // Crepe serializes a freshly-indented nested item as a loose list (a blank
   // line before the child) when several keyboard transactions batch into one
   // deferred markdownUpdated. The generic new-document path compacts this via
-  // compactGeneratedListSpacing; the rebuilt list here must match that, or the
-  // source gains a spurious blank line that the user never sees in rich text.
+  // compactGeneratedListSpacing; the rebuilt region must match that, or source
+  // gains a spurious blank line that the user never sees in rich text.
   const replacement = compactGeneratedListSpacing(normalizedCanonical
     .slice(canonicalList.start, canonicalList.end)
     .replace(/^(\s*)(?:[-+*]|\d{1,9}[.)])(?=\s)/m, `$1${marker}`))
   if (!replacement) return null
   const listWasCreatedInChange = canonicalList.start >= change.start && canonicalList.end <= change.nextEnd
 
-  // Usual path: the dash transaction has already published its escaped
-  // literal source line (`\\-`) before Space turns it into a list.
-  if (Number.isFinite(sourceOffset)) {
-    const sourceLine = lineAt(source, sourceOffset)
-    const sourceMatch = source.slice(sourceLine.start, sourceLine.end).match(
-      isBullet
-        ? /^([ \t]*)\\([-+*])$/
-        : /^([ \t]*)(\d{1,9}[.)])$/
-    )
-    if (sourceMatch?.[2] === marker) {
-      return source.slice(0, sourceLine.start) +
-        adaptCanonicalRegionToSource(replacement, source, sourceLine) +
-        source.slice(sourceLine.end)
-    }
+  if (ownedSourceLine) {
+    return source.slice(0, ownedSourceLine.start) +
+      adaptCanonicalRegionToSource(replacement, source, ownedSourceLine) +
+      source.slice(ownedSourceLine.end)
   }
 
   // The transaction-first mapper may already own a newly-created empty block
@@ -560,6 +752,68 @@ export const preserveTypedBulletInputRule = ({
   return null
 }
 
+// Apply the input-rule reconstruction only to source bytes whose ownership is
+// proven by the captured intent. When the current authored source is still the
+// captured snapshot, the standalone marker line is the complete owned range:
+// generic preservation is allowed to disagree inside that line, but nowhere
+// before or after it. This keeps a correct `\\-` -> `- ` reconstruction
+// from being rejected merely because the generic candidate already rewrote
+// the same marker to Crepe's default `* `.
+export const preserveOwnedTypedBulletInputRule = ({
+  source,
+  currentSource = source,
+  preservedSource = currentSource,
+  ...args
+}) => {
+  const captured = String(source || '')
+  const current = String(currentSource || '')
+  const preserved = String(preservedSource || '')
+  const isBullet = /^[-+*]$/.test(args.marker || '')
+  const isOrdered = /^\d{1,9}[.)]$/.test(args.marker || '')
+  let ownedLine = null
+
+  if (current === captured && Number.isFinite(args.sourceOffset)) {
+    const line = lineAt(captured, args.sourceOffset)
+    const match = captured.slice(line.start, line.end).match(
+      isBullet
+        ? /^([ \t]*)\\([-+*])$/
+        : isOrdered
+          ? /^([ \t]*)(\d{1,9}[.)])$/
+          : /$a/
+    )
+    if (match?.[2] === args.marker) ownedLine = line
+  }
+
+  const markdown = preserveTypedBulletInputRule({
+    source: captured,
+    insertionSource: ownedLine ? current : preserved,
+    ...args
+  })
+  if (typeof markdown !== 'string') return null
+
+  if (ownedLine) {
+    const prefix = current.slice(0, ownedLine.start)
+    const suffix = current.slice(ownedLine.end)
+    return markdown.startsWith(prefix) && markdown.endsWith(suffix)
+      ? markdown
+      : null
+  }
+
+  // For a delayed intent whose captured snapshot is no longer current, retain
+  // the previous fail-closed raw-slot proof. No attempt is made to merge
+  // unrelated edits or to relocate a stale slot.
+  if (Number.isFinite(args.sourceSlotRawStart)) {
+    const boundary = args.sourceSlotRawStart
+    if (
+      markdown.slice(0, boundary) !== preserved.slice(0, boundary) ||
+      markdown.slice(0, boundary) !== captured.slice(0, boundary)
+    ) {
+      return null
+    }
+  }
+  return markdown
+}
+
 // ProseMirror does not retain the token which triggered a list input rule. For
 // bullets that is `-` / `*` / `+`; for ordered lists it is also the punctuation
 // choice in `1.` versus `1)`. Crepe can default the latter to `1)` after a
@@ -619,6 +873,16 @@ export const restoreTypedBulletMarker = ({
         : 0
     return !best || distance < best.distance ? { ...candidate, distance } : best
   }, null)
+  // Only restore the same ordinal with different punctuation (`1.` -> `1)`
+  // or the reverse). Entering a new row makes the changed canonical line a
+  // *different* ordinal (`2.` after typing `1.`); rewriting it would corrupt
+  // the auto-numbered next item and fail the list-slot integrity check.
+  const changedOrderedCandidate = isOrdered && changedLine &&
+    /^\d{1,9}[.)]$/.test(changedLine.match[2]) &&
+    changedLine.match[2].slice(0, -1) === marker.slice(0, -1) &&
+    changedLine.match[2] !== marker
+    ? changedLine
+    : null
   // For an ordered input rule, a newly introduced same-number/different-
   // punctuation token (`1.` -> `1)`) is stronger evidence than the broad
   // document delta. IME commits can batch several list operations together;
@@ -634,44 +898,144 @@ export const restoreTypedBulletMarker = ({
   // distant stale position won and made us abort, so nested `-` lists fell back
   // to Crepe's default `*`.
   const nearbyOffsetTarget = offsetTarget?.distance <= 4 ? offsetTarget : null
-  const target = orderedDefaultCandidate
-    ? { line: orderedDefaultCandidate.line || orderedDefaultCandidate, distance: 0 }
-    : nearbyOffsetTarget || (changedLine ? { line: changedLine, distance: 0 } : null)
+  // The full-document delta is only a reliable target while the intent's own
+  // captured position lands on the same changed row. After Enter creates the
+  // next auto-numbered item, the change begins on the *new* row while the
+  // stale intent still points at the old item: applying the old marker there
+  // would rewrite `2.` back to `1.` and trip the list-slot integrity check.
+  const offsetTargetLine = offsetTarget ? offsetTarget.line : null
+  const changedLineMatchesOffset = Boolean(
+    changedLine && offsetTargetLine &&
+    changedLine.start === offsetTargetLine.start &&
+    changedLine.end === offsetTargetLine.end
+  )
+  // Only a *nearby* offset (the intent's own captured position) can veto the
+  // changed-line fallback: after Enter the caret sits on the new auto-numbered
+  // row while the stale intent still belongs to the old item. A far-away or
+  // missing offset is a stale pre-input position, so the concrete changed row
+  // remains the reliable target (deferred callback / nested-list cases).
+  const offsetIsTrustworthy = Boolean(offsetTarget && offsetTarget.distance <= 4)
+  const fallbackTarget = changedLine &&
+    (!offsetTarget || !offsetIsTrustworthy || changedLineMatchesOffset)
+    ? { line: changedLine, distance: 0 }
+    : null
+  const target = changedOrderedCandidate
+    ? { line: changedOrderedCandidate, distance: 0 }
+    : orderedDefaultCandidate
+      ? { line: orderedDefaultCandidate.line || orderedDefaultCandidate, distance: 0 }
+      : nearbyOffsetTarget || fallbackTarget
   if (!target) return markdown
 
   if (isOrdered) {
     // Ordered punctuation is item-specific: applying a new `1.` to every row
     // at this depth would corrupt existing `2.` / `3.` rows. The canonical and
     // generated strings share list-row order, so patch only the created row.
+    // The typed ordinal is part of the intent: `1.` may only restore a row
+    // that already carries the same ordinal (`1)` -> `1.`). Enter auto-numbers
+    // the next row as `2.`, so a stale `1.` intent must never rewrite it;
+    // doing so trips the list-slot integrity check and blocks saving.
+    if (target.line.match[2].slice(0, -1) !== marker.slice(0, -1)) return markdown
     const sourceLines = listMarkerTokenLines(String(markdown || ''))
-    const ordinal = canonicalLines.findIndex((line) => line.start === target.line.start)
-    const sourceLine = ordinal >= 0 ? sourceLines[ordinal] : null
+    const lineContent = (line) => line.text
+      .replace(/^\s*\d{1,9}[.)]\s+/, '')
+      .replace(/<br\s*\/?>\s*$/i, '')
+      .trim()
+    // Source and canonical do not always have the same marker-row ordinal:
+    // an authored line such as `- 1. text` is one source row but can serialize
+    // as an outer bullet plus a nested ordered row. For repeated item text,
+    // retain the occurrence ordinal within the same indent/content group
+    // instead of using the document-global list-row index.
+    const targetContent = lineContent(target.line)
+    const canonicalMatches = canonicalLines.filter((line) =>
+      line.match[1].length === target.line.match[1].length &&
+      lineContent(line) === targetContent
+    )
+    const targetOccurrence = canonicalMatches.findIndex((line) => line.start === target.line.start)
+    const sourceMatches = sourceLines.filter((line) =>
+      line.match[1].length === target.line.match[1].length &&
+      lineContent(line) === targetContent
+    )
+    const sourceLine = sourceMatches[targetOccurrence] || null
+    if (Array.isArray(globalThis.__hmListMarkerRestoreTrace)) {
+      globalThis.__hmListMarkerRestoreTrace.push({
+        marker,
+        canonicalOffset,
+        changedLine: changedLine ? { start: changedLine.start, end: changedLine.end, token: changedLine.match[2], text: changedLine.text } : null,
+        target: { start: target.line.start, end: target.line.end, token: target.line.match[2], text: target.line.text },
+        targetOccurrence,
+        canonicalMatches: canonicalMatches.map((line) => ({ start: line.start, token: line.match[2], text: line.text })),
+        sourceMatches: sourceMatches.map((line) => ({ start: line.start, token: line.match[2], text: line.text })),
+        sourceLine: sourceLine ? { start: sourceLine.start, token: sourceLine.match[2], text: sourceLine.text } : null
+      })
+      if (globalThis.__hmListMarkerRestoreTrace.length > 20) globalThis.__hmListMarkerRestoreTrace.shift()
+    }
     if (!sourceLine || !/^\d/.test(sourceLine.match[2])) return markdown
     const start = sourceLine.start + sourceLine.match[1].length
     const end = start + sourceLine.match[2].length
     return markdown.slice(0, start) + marker + markdown.slice(end)
   }
 
-  const sourceLines = bulletMarkerLines(String(markdown || ''))
   const targetBlock = listBlockAt(canonicalText, target.line.start)
   if (!targetBlock) return markdown
   const targetIndent = target.line.match[1].length
-  const offsets = canonicalLines
-    .map((line, ordinal) => ({ line, ordinal }))
-    .filter(({ line }) =>
+  const targetRows = canonicalLines
+    .filter((line) =>
       line.start >= targetBlock.start &&
       line.end <= targetBlock.end &&
       line.match[1].length === targetIndent
     )
-    .map(({ ordinal }) => sourceLines[ordinal])
-    .filter(Boolean)
-    .map((line) => line.start + line.match[1].length)
-    .filter((offset) => markdown[offset] !== marker)
-    .sort((left, right) => right - left)
-  return offsets.reduce(
-    (result, offset) => result.slice(0, offset) + marker + result.slice(offset + 1),
-    markdown
+  if (!targetRows.length) return markdown
+
+  // `sourceLines[ordinal]` uses the ordinal of every bullet in the complete
+  // document. That is wrong once an earlier list has a different authored
+  // marker or nesting: the first row of this newly-created list can be paired
+  // with an unrelated old row, leaving the typed `-` as Crepe's `*`. Locate
+  // this list locally by its first item text, then align only rows within that
+  // source block. The visible text is a stronger anchor than a global marker
+  // ordinal and remains valid when earlier source/canonical streams diverge.
+  const bulletContent = (line) => line.text
+    .replace(/^\s*[-+*]\s+(?:\[[ xX]\]\s+)?/, '')
+    .replace(/<br\s*\/?>\s*$/i, '')
+    .trim()
+  const sourceBulletLines = bulletMarkerLines(String(markdown || ''))
+  const sourceVisibleHint = sourceVisiblePositionAtRaw(previousText, targetBlock.start)
+  const sourceRawHint = sourceRawFromVisibleIndex(
+    String(markdown || ''),
+    sourceVisibleHint.visibleIndex,
+    'forward'
   )
+  const firstContent = bulletContent(targetRows[0])
+  const firstCandidates = sourceBulletLines
+    .filter((line) => line.match[1].length === targetIndent && bulletContent(line) === firstContent)
+    .sort((left, right) => Math.abs(left.start - sourceRawHint) - Math.abs(right.start - sourceRawHint))
+  const sourceFirst = firstCandidates[0]
+  const sourceBlock = sourceFirst
+    ? listBlockAt(String(markdown || ''), sourceFirst.start)
+    : null
+  const sourceRows = sourceBlock
+    ? sourceBulletLines.filter((line) =>
+        line.start >= sourceBlock.start &&
+        line.end <= sourceBlock.end &&
+        line.match[1].length === targetIndent
+      )
+    : []
+  if (sourceRows.length < targetRows.length) return markdown
+
+  const offsets = []
+  for (let index = 0; index < targetRows.length; index += 1) {
+    const targetRow = targetRows[index]
+    const matchingRows = sourceRows.filter((row) => bulletContent(row) === bulletContent(targetRow))
+    const sourceRow = matchingRows.length === 1 ? matchingRows[0] : sourceRows[index]
+    if (!sourceRow || bulletContent(sourceRow) !== bulletContent(targetRow)) return markdown
+    const offset = sourceRow.start + sourceRow.match[1].length
+    if (markdown[offset] !== marker) offsets.push(offset)
+  }
+  return offsets
+    .sort((left, right) => right - left)
+    .reduce(
+      (result, offset) => result.slice(0, offset) + marker + result.slice(offset + 1),
+      markdown
+    )
 }
 
 const listMarkerMeta = (markdown) => {
@@ -711,6 +1075,21 @@ const listMarkerRows = (markdown, block) => markdownLines(markdown)
   .map(listMarkerRow)
   .filter(Boolean)
 
+const markdownIndentWidth = (indent) => {
+  let width = 0
+  for (const character of String(indent || '')) {
+    width += character === '\t' ? 4 - (width % 4) : 1
+  }
+  return width
+}
+
+const indentAtLeast = (indent, minimumWidth) => {
+  const width = markdownIndentWidth(indent)
+  return width >= minimumWidth
+    ? indent
+    : `${indent}${' '.repeat(minimumWidth - width)}`
+}
+
 // A list-type conversion changes only the marker/checkbox attributes at one
 // ProseMirror list level. Patch those prefixes in the authored source instead
 // of replacing the whole canonical list tree: outer and nested levels may use
@@ -735,7 +1114,20 @@ const patchConvertedListMarkers = ({ source, sourceList, previous, previousList,
     ) {
       return null
     }
-    if (previousRow.kind === nextRow.kind && previousRow.task === nextRow.task) continue
+    const previousIndentWidth = markdownIndentWidth(previousRow.indent)
+    const nextIndentWidth = markdownIndentWidth(nextRow.indent)
+    // When an ancestor marker grows (`- ` -> `1. `), canonical Markdown moves
+    // descendant markers right by the extra content-indent column. Preserve a
+    // wider authored indent exactly, but raise a narrower one to the new
+    // parse-safe minimum. Decreasing marker width never rewrites authored
+    // indentation, and tabs remain untouched when already sufficient.
+    const indent = nextIndentWidth > previousIndentWidth
+      ? indentAtLeast(sourceRow.indent, nextIndentWidth)
+      : sourceRow.indent
+    const markerChanged =
+      previousRow.kind !== nextRow.kind ||
+      previousRow.task !== nextRow.task
+    if (!markerChanged && indent === sourceRow.indent) continue
 
     // Converting an ordered/task list into an unordered list has no authored
     // bullet character to carry over. Prefer HorseMD's typed-list default (`-`)
@@ -750,7 +1142,7 @@ const patchConvertedListMarkers = ({ source, sourceList, previous, previousList,
     changes.push({
       start: sourceRow.start,
       end: sourceRow.end,
-      text: `${sourceRow.indent}${token}${sourceRow.spacing}${task}${sourceRow.text.slice(sourceRow.prefixEnd)}`
+      text: `${indent}${token}${sourceRow.spacing}${task}${sourceRow.text.slice(sourceRow.prefixEnd)}`
     })
   }
   if (!changes.length) return null
@@ -800,8 +1192,26 @@ const formatCanonicalListLikeSource = (sourceList, previousList, nextList) => {
   if (!sourceIsCompact) return styled.join('\n')
   return styled.filter((line, index, lines) => {
     if (line.trim()) return true
-    const nextNonBlank = lines.slice(index + 1).find((candidate) => candidate.trim())
-    return !nextNonBlank || !listMarker(nextNonBlank)
+    const nextNonBlankIndex = lines.findIndex((candidate, candidateIndex) =>
+      candidateIndex > index && candidate.trim()
+    )
+    if (nextNonBlankIndex < 0) return true
+    const nextNonBlank = lines[nextNonBlankIndex]
+    if (!listMarker(nextNonBlank)) return true
+
+    // RS-64: a compact parent item followed immediately by a BARE nested empty
+    // marker is not valid nested-list Markdown: CommonMark treats the marker as
+    // continuation text (`parent\n*`). Crepe's canonical deliberately inserts
+    // one blank line before `  * <br />` / `   1. <br />`; that separator is
+    // structural, not loose-list formatting. Keep exactly the blank line
+    // immediately before a nested empty marker while still removing ordinary
+    // serializer padding from compact authored lists.
+    const nextRowMeta = nextMeta[nextNonBlankIndex]
+    const nestedEmptyListItem = Boolean(
+      nextRowMeta?.depth > 0 && !comparableListLine(nextNonBlank)
+    )
+    if (nestedEmptyListItem) return nextNonBlankIndex === index + 1
+    return false
   }).join('\n')
 }
 
@@ -837,16 +1247,29 @@ const unescapedPunctuationView = (value) => {
 
 const comparableListLine = (line) => {
   const content = canonicalTextToSource(String(line || '')
-    .replace(/^\s*(?:[-+*]|\d{1,9}[.)])\s+(?:\[[ xX]\]\s+)?/, '')
+    .replace(/^\s*(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)(?:\[[ xX]\]\s+)?/, '')
   )
     .trim()
     .replace(/^<br\s*\/?>$/i, '')
   return unescapedPunctuationView(content).text
 }
 
-const comparableListText = (markdown) => markdown
-  .split('\n')
-  .map(comparableListLine)
+// Cached per-markdown comparable forms: the batched-list mapper asks for the
+// full document's comparable lines once per changed list block; the redis-doc
+// profile had this at ~24% of a 128s preserve call.
+const comparableLineCache = new Map()
+const comparableListLines = (markdown) => {
+  const cached = comparableLineCache.get(markdown)
+  if (cached) return cached
+  const value = markdown.split('\n').map(comparableListLine)
+  if (comparableLineCache.size >= 8) {
+    comparableLineCache.delete(comparableLineCache.keys().next().value)
+  }
+  comparableLineCache.set(markdown, value)
+  return value
+}
+
+const comparableListText = (markdown) => comparableListLines(markdown)
   .filter(Boolean)
   .join('\n')
 
@@ -904,11 +1327,27 @@ const canonicalListSegmentForSource = ({ source, sourceList, canonical, offset }
   // deferred Crepe update includes the Enter transaction and its text together.
   // The authored next-list fence below is the real boundary we need here.
   const lines = markdownLines(canonical)
-  const candidates = lines
-    .map((line, index) => ({ line, index, comparable: comparableListLine(line.text) }))
-    .flatMap((candidate) => anchors
-      .filter((anchor) => anchor.text === candidate.comparable)
-      .map((anchor) => ({ ...candidate, sourceIndex: anchor.sourceIndex })))
+  const comparableByLine = comparableListLines(canonical)
+  // Anchor lookup by exact comparable text. The previous lines×anchors filter
+  // was O(lines × anchors) string compares per changed list block — on the
+  // redis doc (13k lines, hundreds of anchors) this loop alone was ~26% of
+  // the whole preserve call. A Map keeps anchor order per text, so the
+  // produced candidates are byte-identical to the old filter chain.
+  const anchorByText = new Map()
+  for (const anchor of anchors) {
+    const bucket = anchorByText.get(anchor.text)
+    if (bucket) bucket.push(anchor.sourceIndex)
+    else anchorByText.set(anchor.text, [anchor.sourceIndex])
+  }
+  const candidates = []
+  for (let index = 0; index < lines.length; index += 1) {
+    const comparable = comparableByLine[index]
+    const bucket = comparable ? anchorByText.get(comparable) : null
+    if (!bucket) continue
+    for (const sourceIndex of bucket) {
+      candidates.push({ line: lines[index], index, comparable, sourceIndex })
+    }
+  }
   if (!candidates.length) return null
   const candidate = candidates.reduce((best, current) => {
     const distance = Number.isFinite(offset)
@@ -957,13 +1396,56 @@ const authoredTopLevelListBlocks = (markdown) => {
 }
 
 const applyStableListRowTextDelta = ({ sourceRow, previousRow, nextRow }) => {
-  const sourceContent = sourceRow.text.slice(sourceRow.marker.prefixEnd)
-  const previousContent = previousRow.text.slice(previousRow.marker.prefixEnd)
-  const nextContent = nextRow.text.slice(nextRow.marker.prefixEnd)
+  // `markdownLines` keeps the CR of a CRLF line inside `line.text`, and the
+  // marker's `(\s+)` spacing group then swallows it (`- \r`, prefixEnd=3).
+  // Split the trailing CR off the CONTENT before diffing, and splice it back
+  // AFTER the new text: without this, a fill of an authored empty item on a
+  // CRLF file emitted `- \r死了暖风机` — the mid-line CR broke the row into
+  // an empty item plus a separate paragraph (0.13.186 trace 15:52) and the
+  // validator correctly fail-closed on it.
+  const trailingCr = (row) => {
+    const raw = row.text.slice(row.marker.prefixEnd)
+    return raw.endsWith('\r') ? raw.slice(0, -1) : raw
+  }
+  const sourceContent = trailingCr(sourceRow)
+  const previousContent = trailingCr(previousRow)
+  const nextContent = trailingCr(nextRow)
+  // The marker prefix slice must not keep the CR the spacing group
+  // swallowed (`- \r`, prefixEnd=3): the terminator is re-appended by
+  // adaptCanonicalRegionToSource's trailing-CR rule, never inline here
+  // (a literal `\r` inside the replacement would be EOL-converted into a
+  // spurious blank line).
+  const rowPrefix = sourceRow.text.slice(0, sourceRow.marker.prefixEnd)
+  const sourcePrefix = rowPrefix.endsWith('\r') ? rowPrefix.slice(0, -1) : rowPrefix
   const sourceView = unescapedPunctuationView(sourceContent)
   const previousView = unescapedPunctuationView(previousContent)
   const nextView = unescapedPunctuationView(nextContent)
   if (sourceView.text !== previousView.text) return null
+  // Filling an authored empty item with exactly `1.` / `1)` is serialized by
+  // Crepe as a protective `1\\.` / `1\\)`. The generic unescaped view below
+  // intentionally removes punctuation escapes for ordinary text deltas, but
+  // doing that for the entire newly-filled body changes Markdown structure.
+  if (!previousContent.trim() && /^\s*\d{1,9}\\[.)]\s*$/.test(nextContent)) {
+    return sourcePrefix + nextContent
+  }
+  // After the ordered input rule's transient `1. ` frame, typing ordinary
+  // body text makes Crepe serialize the same bullet item back as the literal
+  // text `1\\. body`. The generic punctuation view deliberately erases that
+  // protective escape and would persist `- 1. body`, changing the authored
+  // bullet into nested ordered-list syntax. Restore the canonical escaped body
+  // only for this exact reversible transition: the prior body must consist of
+  // one ordered marker plus whitespace, and next must use the same number and
+  // delimiter as an escaped literal followed by whitespace/body text.
+  const previousTransientOrdered = previousContent.match(/^\s*(\d{1,9})([.)])[ \t]+$/)
+  const nextEscapedOrderedLiteral = nextContent.match(/^\s*(\d{1,9})\\([.)])(?:[ \t]+.*)?$/)
+  if (
+    previousTransientOrdered &&
+    nextEscapedOrderedLiteral &&
+    previousTransientOrdered[1] === nextEscapedOrderedLiteral[1] &&
+    previousTransientOrdered[2] === nextEscapedOrderedLiteral[2]
+  ) {
+    return sourcePrefix + nextContent
+  }
 
   const { start, previousEnd, nextEnd } = commonChange(previousView.text, nextView.text)
   const rawStart = sourceView.boundaries[start]
@@ -972,7 +1454,7 @@ const applyStableListRowTextDelta = ({ sourceRow, previousRow, nextRow }) => {
   const content = sourceContent.slice(0, rawStart) +
     nextView.text.slice(start, nextEnd) +
     sourceContent.slice(rawEnd)
-  return sourceRow.text.slice(0, sourceRow.marker.prefixEnd) + content
+  return sourcePrefix + content
 }
 
 const preserveOrdinalBatchedListRows = ({ source, previous, next, requireMultiple }) => {
@@ -1529,6 +2011,106 @@ export const preserveListBlockChange = ({ source, previous, next, start, previou
   }
 }
 
+// RS-67: clearing the text of a list item that still owns a nested child is a
+// body edit, never an item deletion. In a source/canonical-diverged document
+// the generic nested-list mapper can otherwise drop the entire parent marker
+// (`1. 啊` -> nothing) and leave only the indented child, changing list depth.
+// Claim only the exact raw-canonical transaction where ONE parent marker row
+// changes from non-empty body to `<br />`, restoring that row reproduces the
+// complete previous canonical byte-for-byte, and the next nonblank row is an
+// unchanged deeper marker. Locate the authored parent by the parent+child pair
+// and require a unique match before deleting only the parent's body bytes.
+export const preserveNestedListParentBodyEmptied = ({ source, previous, next }) => {
+  const sourceText = String(source || '')
+  const previousText = String(previous || '')
+  const nextText = String(next || '')
+  if (!sourceText || !previousText || !nextText || previousText === nextText) return null
+
+  const parseRow = (line) => {
+    const match = line?.text?.match(/^(\s*)([-+*]|\d{1,9}[.)])([ \t]+)(.*)$/)
+    if (!match) return null
+    return {
+      line,
+      indent: match[1].length,
+      token: match[2],
+      kind: /^\d/.test(match[2]) ? 'ordered' : 'bullet',
+      prefixEnd: match[1].length + match[2].length + match[3].length,
+      body: match[4]
+    }
+  }
+  const compatibleToken = (sourceToken, canonicalToken) => {
+    const sourceOrdered = /^(\d{1,9})[.)]$/.exec(sourceToken || '')
+    const canonicalOrdered = /^(\d{1,9})[.)]$/.exec(canonicalToken || '')
+    if (sourceOrdered || canonicalOrdered) {
+      return Boolean(sourceOrdered && canonicalOrdered && sourceOrdered[1] === canonicalOrdered[1])
+    }
+    return /^[-+*]$/.test(sourceToken || '') && /^[-+*]$/.test(canonicalToken || '')
+  }
+  const nextNonblankRow = (lines, fromIndex) => {
+    for (let index = fromIndex + 1; index < lines.length; index += 1) {
+      if (!lines[index].text.trim()) continue
+      return { index, meta: parseRow(lines[index]) }
+    }
+    return null
+  }
+
+  const previousLines = markdownLines(previousText)
+  const nextLines = markdownLines(nextText)
+  const canonicalCandidates = []
+  for (let index = 0; index < nextLines.length; index += 1) {
+    const nextParent = parseRow(nextLines[index])
+    if (!nextParent || !/^<br\s*\/?>\s*$/i.test(nextParent.body)) continue
+    const previousLine = previousLines[index]
+    const previousParent = parseRow(previousLine)
+    if (
+      !previousParent ||
+      previousParent.indent !== nextParent.indent ||
+      previousParent.token !== nextParent.token ||
+      !previousParent.body.trim() ||
+      /^<br\s*\/?>\s*$/i.test(previousParent.body)
+    ) continue
+    const restored = nextText.slice(0, nextParent.line.start) +
+      previousParent.line.text +
+      nextText.slice(nextParent.line.end)
+    if (restored !== previousText) continue
+    const child = nextNonblankRow(nextLines, index)
+    if (!child?.meta || child.meta.indent <= nextParent.indent) continue
+    canonicalCandidates.push({ previousParent, nextParent, child: child.meta })
+  }
+  if (canonicalCandidates.length !== 1) return null
+  const { previousParent, child } = canonicalCandidates[0]
+
+  const authoredParentBody = canonicalTextToSource(previousParent.body)
+  const authoredChildBody = canonicalTextToSource(child.body)
+  const sourceLines = markdownLines(sourceText)
+  const sourceMatches = []
+  for (let index = 0; index < sourceLines.length; index += 1) {
+    const parent = parseRow(sourceLines[index])
+    if (
+      !parent ||
+      parent.indent !== previousParent.indent ||
+      parent.body !== authoredParentBody ||
+      !compatibleToken(parent.token, previousParent.token)
+    ) continue
+    const nested = nextNonblankRow(sourceLines, index)
+    if (
+      !nested?.meta ||
+      nested.meta.indent <= parent.indent ||
+      !compatibleToken(nested.meta.token, child.token) ||
+      nested.meta.body !== authoredChildBody
+    ) continue
+    sourceMatches.push(parent)
+  }
+  if (sourceMatches.length !== 1) return null
+  const sourceParent = sourceMatches[0]
+  const bodyStart = sourceParent.line.start + sourceParent.prefixEnd
+  return {
+    markdown: sourceText.slice(0, bodyStart) + sourceText.slice(sourceParent.line.end),
+    preserved: true,
+    reason: 'nested-list-parent-body-emptied'
+  }
+}
+
 // Enter creates a real empty list item in ProseMirror, but Crepe serializes its
 // content as a `<br />` placeholder. The authored source intentionally keeps
 // that item as `- ` (without the placeholder). When the first text is typed,
@@ -1544,10 +2126,109 @@ export const preserveEmptyListItemTextChange = ({
   previousEnd,
   nextEnd
 }) => {
+  // Tail lists are a special zero-visible boundary: the authored source can
+  // already contain `- ` while the canonical snapshot has `* <br />`. The
+  // document-wide list-block ordinal is unreliable here (earlier authored
+  // bullet runs may have been merged by remark), so resolve the empty row from
+  // the changed canonical lines and the nearest raw tail slot first.
+  const changedRows = (markdown, contentRequired) => markdownLines(markdown)
+    .map((line) => ({ ...line, marker: listMarkerRow(line) }))
+    .filter((line) => {
+      if (!line.marker || line.end < start || line.start > (contentRequired ? nextEnd : previousEnd)) return false
+      const content = comparableListLine(line.text)
+      return contentRequired ? !!content : !content
+    })
+    .sort((left, right) => Math.abs(left.start - start) - Math.abs(right.start - start))
+  const previousEmptyRow = changedRows(previous, false)[0]
+  const nextFilledRow = changedRows(next, true)[0]
+  if (previousEmptyRow && nextFilledRow && previousEmptyRow.marker.kind === nextFilledRow.marker.kind) {
+    const sourceHint = sourceRawFromVisibleIndex(
+      source,
+      sourceVisiblePositionAtRaw(previous, previousEmptyRow.start).visibleIndex,
+      'forward'
+    )
+    const sourceRows = markdownLines(source)
+      .map((line) => ({ ...line, marker: listMarkerRow(line) }))
+      .filter((line) => line.marker &&
+        line.marker.kind === previousEmptyRow.marker.kind &&
+        !comparableListLine(line.text))
+    const sourceRow = sourceRows
+      .sort((left, right) => Math.abs(left.start - sourceHint) - Math.abs(right.start - sourceHint))[0]
+    if (sourceRow) {
+      const sourceSuffix = sourceVisibleIndex(source.slice(sourceRow.end)).text
+      const previousSuffix = sourceVisibleIndex(previous.slice(previousEmptyRow.end)).text
+      const nextContent = nextFilledRow.text.slice(nextFilledRow.marker.prefixEnd)
+        .replace(/<br[^>]*>\\s*$/i, '')
+      if (
+        sourceSuffix === previousSuffix &&
+        nextContent.trim() &&
+        sourceRow.marker.kind === 'bullet'
+      ) {
+        // A newly typed list-item body that is exactly `1.` / `1)` is
+        // serialized as `1\\.` / `1\\)` to keep it literal. Dropping that
+        // protective escape here changes the item body into list syntax before
+        // the user's following input can disambiguate it. Inline punctuation
+        // elsewhere still follows the normal canonical→source translation.
+        const authoredNextContent = /^\s*\d{1,9}\\[.)]\s*$/.test(nextContent)
+          ? nextContent
+          : canonicalTextToSource(nextContent)
+        // Local CR-stripped prefix (sourcePrefix belongs to a different
+        // function's scope): a CRLF row's marker prefix keeps its CR out of
+        // the replacement; the row terminator re-appends it.
+        const localPrefixRow = sourceRow.text.slice(0, sourceRow.marker.prefixEnd)
+        const localPrefix = localPrefixRow.endsWith('\r') ? localPrefixRow.slice(0, -1) : localPrefixRow
+        const replacement = localPrefix + authoredNextContent
+        return {
+          markdown: source.slice(0, sourceRow.start) + replacement + source.slice(sourceRow.end),
+          preserved: true,
+          reason: 'tail-empty-list-item-filled'
+        }
+      }
+    }
+  }
+
   const previousList = listBlockNear(previous, start, previousEnd)
   const nextList = listBlockNear(next, start, nextEnd)
   if (!previousList || !nextList) return null
   if (!hasEmptyListItem(previous, previousList) || hasEmptyListItem(next, nextList)) return null
+
+  // RS-54: this mapper owns "empty item gains text", not list deletion or a
+  // cross-type boundary collapse. When an isolated empty bullet after an
+  // ordered list is removed, `listBlockNear(next, ...)` can resolve the
+  // neighbouring ordered list. Treating that as a fill replaces the authored
+  // `- ` slot with a copy of the ordered block. Require the list marker kind to
+  // remain stable before any ordinal/source replacement is attempted.
+  const listKind = (markdown, block) => markdownLines(markdown.slice(block.start, block.end))
+    .map((line) => listMarkerRow(line)?.kind || null)
+    .find(Boolean)
+  if (listKind(previous, previousList) !== listKind(next, nextList)) return null
+
+  // RS-72: this mapper is a text-fill mapper, not an empty-item deletion /
+  // structural-compaction mapper. Backspace on an empty ordered item can make
+  // ProseMirror lift the empty paragraph and renumber the following sibling in
+  // the same transaction (`2. <br /> / 3. C` -> indented `<br /> / 2. C`).
+  // The old gate only checked "previous has empty, next has none", so it
+  // claimed that structural transaction and formatted the shorter next list
+  // over the source, dropping the successor row. Require an unchanged list-row
+  // skeleton and exactly one empty marker row gaining text. Any marker token,
+  // indentation, row-count, or unrelated body change belongs to a structural
+  // list mapper instead.
+  const previousRows = flatListItemRows(previous.slice(previousList.start, previousList.end))
+  const nextRows = flatListItemRows(next.slice(nextList.start, nextList.end))
+  if (previousRows.length !== nextRows.length) return null
+  let filledRows = 0
+  for (let index = 0; index < previousRows.length; index += 1) {
+    const before = previousRows[index]
+    const after = nextRows[index]
+    if (before.indent !== after.indent || before.token !== after.token) return null
+    if (!before.text && after.text) {
+      if (!before.token) return null
+      filledRows += 1
+      continue
+    }
+    if (before.text !== after.text) return null
+  }
+  if (filledRows !== 1) return null
 
   const previousBlocks = listBlocksInSourceOrder(previous)
   const sourceBlocks = listBlocksInSourceOrder(source)
@@ -1613,8 +2294,13 @@ export const preserveDivergedNestedListChange = ({
   const sourceItems = sourceListItemRows(source.slice(sourceList.start, sourceList.end))
   if (!sourceItems.length) return null
   const nestedMarkerPrefixLength = (row) =>
-    row.text.match(/^(?:[-+*]|\d{1,9}[.)])\s+/)?.[0]?.length || 0
+    row.text.match(/^(?:[-+*]|\d{1,9}[.)])(?:[ \t]+|$)/)?.[0]?.length || 0
   const authoredCanonicalText = (row) => row.text.slice(nestedMarkerPrefixLength(row))
+  // Compare canonical item text in its authored-source spelling. A leading
+  // user space is serialized by Crepe as `&#x20;` but persisted as U+200B +
+  // space, so raw string equality rejects an otherwise unchanged sibling and
+  // prevents a zero-visible nested-list exit from reaching the item diff.
+  const canonicalAuthoredText = (item) => canonicalTextToSource(item?.text || '')
   const nextList = outerTopLevelListBlock(next, start)
   if (!nextList) {
     // Backspace can fully lift the first list row into a plain paragraph. The
@@ -1624,11 +2310,15 @@ export const preserveDivergedNestedListChange = ({
     const nextLine = lineAt(next, start)
     const liftedText = next.slice(nextLine.start, nextLine.end).replace(/\r$/, '').trim()
     if (!liftedText || previousItems[0]?.text !== liftedText) return null
-    if (authoredCanonicalText(sourceItems[0] || { text: '' }) !== previousItems[0].text) return null
+    if (
+      authoredCanonicalText(sourceItems[0] || { text: '' }) !== canonicalAuthoredText(previousItems[0])
+    ) return null
     const remainingPrevious = previousItems.slice(1)
     const remainingSource = sourceItems.slice(1)
     if (remainingPrevious.length !== remainingSource.length) return null
-    if (remainingPrevious.some((item, index) => authoredCanonicalText(remainingSource[index]) !== item.text)) return null
+    if (remainingPrevious.some((item, index) =>
+      authoredCanonicalText(remainingSource[index]) !== canonicalAuthoredText(item)
+    )) return null
     const followingList = topLevelListBlocksInSourceOrder(next)
       .find((block) => block.start > nextLine.end)
     if (remainingPrevious.length) {
@@ -1666,6 +2356,121 @@ export const preserveDivergedNestedListChange = ({
     }
   }
   const nextItems = flatListItemRows(next.slice(nextList.start, nextList.end))
+
+  // Typing a trailing space after a literal ordered marker inside a bullet
+  // (`- 1\\.`) produces a brief, real input-rule structure in Crepe. Its
+  // canonical spelling is the compact `* 1. ` form: structurally that is an
+  // EMPTY outer bullet containing an EMPTY ordered child, not literal text.
+  // The next IME/text transaction can immediately turn it back into literal
+  // `* 1\\. text`. Keep both frames source-equivalent instead of either
+  // dropping the protective escape (`- 1.`) or relaxing the list-slot proof.
+  //
+  // This bridge is deliberately fail-closed: exactly one flattened item must
+  // change, the number+delimiter must match, and the corresponding authored row
+  // inside this source list must be unique.
+  const preserveInlineOrderedInputRuleTransient = () => {
+    const sameFlatItem = (left, right) =>
+      left?.token === right?.token && left?.text === right?.text
+    let localPrefix = 0
+    while (
+      localPrefix < previousItems.length &&
+      localPrefix < nextItems.length &&
+      sameFlatItem(previousItems[localPrefix], nextItems[localPrefix])
+    ) localPrefix += 1
+    let localSuffix = 0
+    while (
+      localSuffix < previousItems.length - localPrefix &&
+      localSuffix < nextItems.length - localPrefix &&
+      sameFlatItem(
+        previousItems[previousItems.length - 1 - localSuffix],
+        nextItems[nextItems.length - 1 - localSuffix]
+      )
+    ) localSuffix += 1
+    if (
+      previousItems.length - localPrefix - localSuffix !== 1 ||
+      nextItems.length - localPrefix - localSuffix !== 1
+    ) return null
+
+    const previousItem = previousItems[localPrefix]
+    const nextItem = nextItems[localPrefix]
+    const previousLiteral = previousItem?.text?.match(/^(\d{1,9})\\([.)])$/)
+    // A fast human cadence can coalesce the `.` and following Space into the
+    // same preservation callback. In that frame the last published source is
+    // still `- 1`, while Crepe has already applied the ordered input rule and
+    // serializes `* 1. `. Treat this as the same transient bridge as the
+    // independently-published `- 1\\.` case, but only when the authored row is
+    // the unique bullet row whose complete text is exactly that bare number.
+    const previousBareNumber = previousItem?.text?.match(/^(\d{1,9})$/)
+    const nextTransient = nextItem?.raw?.match(
+      /^(\s*)([-+*])([ \t]+)(\d{1,9})([.)])([ \t]+)$/
+    )
+    const transientNumber = previousLiteral?.[1] || previousBareNumber?.[1] || null
+    const transientDelimiter = previousLiteral?.[2] || nextTransient?.[5] || null
+    if (
+      (previousLiteral || previousBareNumber) &&
+      nextTransient &&
+      /^[-+*]$/.test(previousItem.token || '') &&
+      previousItem.token === nextItem.token &&
+      transientNumber === nextTransient[4] &&
+      transientDelimiter === nextTransient[5]
+    ) {
+      const candidates = sourceItems.filter((row) =>
+        /^[-+*]$/.test(row.token || '') &&
+        row.text.trim() === previousItem.text
+      )
+      if (candidates.length !== 1) return null
+      const row = candidates[0]
+      const rawStart = sourceList.start + row.start
+      const rawEnd = sourceList.start + row.end
+      const nested = `${' '.repeat(row.indent)}${row.token}   ${transientNumber}${transientDelimiter} `
+      return {
+        markdown: source.slice(0, rawStart) + nested + source.slice(rawEnd),
+        preserved: true,
+        reason: 'diverged-inline-ordered-input-rule',
+        nextBaseline: previous.slice(0, previousList.start) +
+          next.slice(nextList.start, nextList.end) +
+          previous.slice(previousList.end)
+      }
+    }
+
+    const previousTransient = previousItem?.raw?.match(
+      /^(\s*)([-+*])([ \t]+)(\d{1,9})([.)])([ \t]+)$/
+    )
+    const nextLiteral = nextItem?.text?.match(/^(\d{1,9})\\([.)])(?:[ \t]+.*)?$/)
+    if (
+      previousTransient &&
+      nextLiteral &&
+      /^[-+*]$/.test(previousItem.token || '') &&
+      previousItem.token === nextItem.token &&
+      previousTransient[4] === nextLiteral[1] &&
+      previousTransient[5] === nextLiteral[2]
+    ) {
+      const nestedBody = new RegExp(
+        `^${previousTransient[4]}${previousTransient[5] === '.' ? '\\.' : '\\)'}[ \\t]+$`
+      )
+      const candidates = sourceItems.filter((row) =>
+        /^[-+*]$/.test(row.token || '') && nestedBody.test(row.text)
+      )
+      if (candidates.length !== 1) return null
+      const row = candidates[0]
+      const rawStart = sourceList.start + row.start
+      const rawEnd = sourceList.start + row.end
+      const literalPrefix = `${nextLiteral[1]}\\${nextLiteral[2]}`
+      const literalTail = nextItem.text.slice(literalPrefix.length)
+      const literal = `${' '.repeat(row.indent)}${row.token} ${literalPrefix}${canonicalTextToSource(literalTail)}`
+      return {
+        markdown: source.slice(0, rawStart) + literal + source.slice(rawEnd),
+        preserved: true,
+        reason: 'diverged-inline-ordered-input-rule',
+        nextBaseline: previous.slice(0, previousList.start) +
+          next.slice(nextList.start, nextList.end) +
+          previous.slice(previousList.end)
+      }
+    }
+    return null
+  }
+  const inlineOrderedInputRule = preserveInlineOrderedInputRuleTransient()
+  if (inlineOrderedInputRule) return inlineOrderedInputRule
 
   // Align every non-empty previous canonical item with an authored row (loose
   // match strips the author's literal numbering prefix `1. `). Enter inside an
@@ -1707,7 +2512,7 @@ export const preserveDivergedNestedListChange = ({
     const sourceRow = sourceItems[sourceIndex]
     const target = authoredCanonicalText(sourceRow)
     const prefixLength = nestedMarkerPrefixLength(sourceRow)
-    if (target === item.text) {
+    if (target === canonicalAuthoredText(item)) {
       aligned.push({ row: sourceIndex, at: prefixLength, span: false })
       sourceIndex += 1
       itemIndex += 1
@@ -1751,6 +2556,7 @@ export const preserveDivergedNestedListChange = ({
   const sourceRows = sourceItems
   let applyOffset = 0
   let insertionCursor = null
+  let nestedOrderedInsertionTemplate = null
   const eol = lineEndingNear(source, sourceList.start)
   const authoredBullet = sourceRows.find((candidate) => /^[-+*]$/.test(candidate.token || ''))?.token || '-'
   const changedCount = Math.max(previousChanged, nextChanged)
@@ -1763,6 +2569,7 @@ export const preserveDivergedNestedListChange = ({
     const row = alignedItem && alignedItem.row != null ? sourceRows[alignedItem.row] : null
     if (prevItem && nextItem && (prevItem.text !== '' || (row != null && alignedItem.row != null))) {
       insertionCursor = null
+      nestedOrderedInsertionTemplate = null
       // Text change inside the same item.
       if (!row) return null
       const previousNumber = /^\d{1,9}[.)]$/.test(prevItem.token || '') ? prevItem.token : ''
@@ -1787,11 +2594,20 @@ export const preserveDivergedNestedListChange = ({
         // A final Backspace lifts the outer bullet item into an indented
         // continuation of the preceding item. Keep the text and replace only
         // the authored marker prefix with the canonical continuation indent.
+        // When the canonical separates that continuation with a BLANK line it
+        // is its own PARAGRAPH inside the item (trace-48689 04:41:38: the
+        // join left [paragraph, paragraph] in one item); replicating only the
+        // indent would produce a lazy continuation that re-parses as a single
+        // paragraph and drift from the document. Insert the blank line too.
         const rawStart = sourceList.start + row.start + applyOffset
         const rawEnd = sourceList.start + row.contentStart + applyOffset
         const continuationIndent = ' '.repeat(Math.max(1, Number(nextItem.indent) || row.indent + 2))
-        output = output.slice(0, rawStart) + continuationIndent + output.slice(rawEnd)
-        applyOffset += continuationIndent.length - (rawEnd - rawStart)
+        const continuationSeparator = nextItem.blankBefore ? eol : ''
+        output = output.slice(0, rawStart) +
+          continuationSeparator +
+          continuationIndent +
+          output.slice(rawEnd)
+        applyOffset += continuationSeparator.length + continuationIndent.length - (rawEnd - rawStart)
       }
       if (prevItem.text !== nextItem.text) {
         const rowText = row.text
@@ -1804,7 +2620,22 @@ export const preserveDivergedNestedListChange = ({
         if (at < 0 || at + (prevItem.text || '').length > rowText.length) return null
         const rawStart = sourceList.start + row.contentStart + at + applyOffset
         const rawEnd = rawStart + prevItem.text.length
-        const authoredText = canonicalTextToSource(nextItem.text)
+        let authoredText = canonicalTextToSource(nextItem.text)
+        // Filling an EMPTY item whose authored row is a bare marker (`1.` with
+        // no trailing space) inserts exactly at the row end. The canonical
+        // marker carries the separator space (`1. 色粉`), so the authored row
+        // must gain it too; without it `1.色粉` stops being a list item and
+        // becomes a paragraph.
+        const rowRawEnd = sourceList.start + row.end + applyOffset
+        const rowRaw = source.slice(sourceList.start + row.start, sourceList.start + row.end)
+        if (
+          prevItem.text === '' &&
+          rawStart === rowRawEnd &&
+          !/[ \t]$/.test(rowRaw) &&
+          !/^[ \t]/.test(authoredText)
+        ) {
+          authoredText = ' ' + authoredText
+        }
         output = output.slice(0, rawStart) + authoredText + output.slice(rawEnd)
         applyOffset += authoredText.length - prevItem.text.length
       }
@@ -1825,17 +2656,120 @@ export const preserveDivergedNestedListChange = ({
           : sourceList.start + applyOffset
       const anchorHasEol = Boolean(anchorRow && anchorRow.breakEnd > anchorRow.end)
       const leading = insertionCursor == null && anchorRow && !anchorHasEol ? eol : ''
+      const sourceBullet = anchorRow && /^[-+*]$/.test(anchorRow.token)
+        ? anchorRow.token
+        : authoredBullet
+      const sourceOrdered = anchorRow && /^\d/.test(anchorRow.token)
+      const orderedToken = sourceOrdered
+        ? `${nextItem.token.slice(0, -1)}${anchorRow.token.slice(-1)}`
+        : nextItem.token
+
+      // `- 1. text` is authored as one bullet row, but remark consumes the
+      // inline `1.` as a nested ordered marker. If Enter creates another
+      // ordered sibling, writing `- 2. child` would create a NEW outer bullet
+      // and fail both semantic and raw-list integrity. Continue the ordered
+      // list at the outer bullet's real content column instead. Derive that
+      // column from the raw prefix (`- ` -> two spaces, `-   ` -> four) and
+      // preserve the author's ordered delimiter (`.` vs `)`). The canonical
+      // item must still be deeper than the authored outer bullet, so genuine
+      // top-level ordered insertions keep the existing path below.
+      const anchorRaw = anchorRow
+        ? source.slice(
+            sourceList.start + anchorRow.start,
+            sourceList.start + anchorRow.end
+          )
+        : ''
+      const sourceOrderedSameDepth = Boolean(
+        sourceOrdered &&
+        Number(nextItem.indent) === Number(anchorRow?.indent || 0)
+      )
+      // RS-71: when Enter appends a sibling after an already-authored nested
+      // ordered row, the source row itself is the structural anchor. Preserve
+      // its exact authored leading whitespace together with its `.` / `)`
+      // delimiter. Top-level ordered rows have an empty prefix, while a deeper
+      // canonical child (different indent) keeps the pre-existing behavior.
+      const sourceOrderedIndent = sourceOrderedSameDepth
+        ? (anchorRaw.match(/^([ \t]*)/)?.[1] || '')
+        : ''
+      const outerBulletPrefix = anchorRaw.match(/^([ \t]*)([-+*])([ \t]+)/)
+      const inlineOrderedMarker = anchorRow?.text?.match(/^(\d{1,9})([.)])(?:[ \t]+|$)/)
+      const nestedOrderedFromAnchor = Boolean(
+        outerBulletPrefix &&
+        inlineOrderedMarker &&
+        /^[-+*]$/.test(anchorRow?.token || '') &&
+        /^\d{1,9}[.)]$/.test(nextItem.token || '') &&
+        Number(nextItem.indent) > Number(anchorRow?.indent || 0)
+      )
+      const inheritedNestedOrdered = Boolean(
+        insertionCursor != null &&
+        nestedOrderedInsertionTemplate &&
+        /^\d{1,9}[.)]$/.test(nextItem.token || '') &&
+        Number(nextItem.indent) > Number(anchorRow?.indent || 0)
+      )
+      const nestedOrderedContinuation = nestedOrderedFromAnchor || inheritedNestedOrdered
+      const nestedOrderedIndent = nestedOrderedFromAnchor
+        ? `${outerBulletPrefix[1]} ${outerBulletPrefix[3]}`
+        : nestedOrderedInsertionTemplate?.indent || ''
+      const nestedOrderedDelimiter = nestedOrderedFromAnchor
+        ? inlineOrderedMarker[2]
+        : nestedOrderedInsertionTemplate?.delimiter || nextItem.token.slice(-1)
+      const nestedOrderedToken = nestedOrderedContinuation
+        ? `${nextItem.token.slice(0, -1)}${nestedOrderedDelimiter}`
+        : ''
       const prefix = !nextItem.token
         ? ' '.repeat(Math.max(1, Number(nextItem.indent) || 2))
         : /^\d/.test(nextItem.token)
-          ? `${authoredBullet} ${nextItem.token} `
-          : `${' '.repeat(Math.max(0, Number(nextItem.indent) || 0))}${authoredBullet} `
+          ? nestedOrderedContinuation
+            ? `${nestedOrderedIndent}${nestedOrderedToken} `
+            : sourceOrdered
+              ? `${sourceOrderedIndent}${orderedToken} `
+              : `${sourceBullet} ${nextItem.token} `
+          : `${' '.repeat(Math.max(0, Number(nextItem.indent) || 0))}${sourceBullet} `
       const inserted = leading + prefix + canonicalTextToSource(nextItem.text) + eol
       output = output.slice(0, insertAt) + inserted + output.slice(insertAt)
       insertionCursor = insertAt + inserted.length
       applyOffset += inserted.length
+      nestedOrderedInsertionTemplate = nestedOrderedContinuation
+        ? { indent: nestedOrderedIndent, delimiter: nestedOrderedDelimiter }
+        : null
+
+      // Two rapid Enters can be published as one zero-visible edit: an empty
+      // nested ordered row is created and immediately lifted to a new TOP-LEVEL
+      // bullet item. In diverged authored syntax (`-   1. text`), unchanged
+      // following top-level canonical items can still be stored as indented
+      // source rows. Before the insertion those rows are part of the old
+      // authored encoding; after inserting a new top-level empty item the same
+      // indentation would make Markdown parse them as CHILDREN of that new
+      // item. For this exact one-item insertion, promote only the unchanged
+      // canonical top-level suffix rows by removing their marker indentation.
+      // Marker token, leading-space sentinel and content stay byte-for-byte.
+      if (
+        previousChanged === 0 &&
+        nextChanged === 1 &&
+        !nextItem.text &&
+        Number(nextItem.indent) === 0 &&
+        /^[-+*]$/.test(nextItem.token || '') &&
+        suffix > 0
+      ) {
+        for (let suffixOffset = 0; suffixOffset < suffix; suffixOffset += 1) {
+          const previousSuffixIndex = previousItems.length - suffix + suffixOffset
+          const nextSuffixIndex = nextItems.length - suffix + suffixOffset
+          const canonicalFollower = nextItems[nextSuffixIndex]
+          const followerAlignment = aligned[previousSuffixIndex]
+          const followerRow = followerAlignment?.row != null
+            ? sourceRows[followerAlignment.row]
+            : null
+          if (!canonicalFollower || Number(canonicalFollower.indent) !== 0) continue
+          if (!followerRow || followerRow.indent <= 0 || !followerRow.token) continue
+          const rawStart = sourceList.start + followerRow.start + applyOffset
+          const rawEnd = rawStart + followerRow.indent
+          output = output.slice(0, rawStart) + output.slice(rawEnd)
+          applyOffset -= followerRow.indent
+        }
+      }
     } else if (prevItem && prevItem.text !== '' && !nextItem) {
       insertionCursor = null
+      nestedOrderedInsertionTemplate = null
       // Item removed: drop its text (span row) or the whole authored row.
       if (!row) return null
       if (alignedItem.span) {
@@ -1863,6 +2797,486 @@ export const preserveDivergedNestedListChange = ({
       : 'diverged-nested-list-change',
     nextBaseline
   }
+}
+
+// Backspace on one empty ordered item removes that item, renumbers its
+// successor, and leaves one editor-only empty paragraph inside the preceding
+// item. Crepe serializes the transient paragraph as an indented standalone
+// `<br />`; authored Markdown must persist only the real row deletion and
+// renumbering. The left/empty/right rows are proven uniquely on previous,
+// next, and source before any bytes are changed.
+export const preserveSingleEmptyOrderedBackspaceLift = ({ source, previous, next }) => {
+  const rowMeta = (line) => {
+    const text = line.text.endsWith('\r') ? line.text.slice(0, -1) : line.text
+    const match = text.match(/^([ \t]*)(\d{1,9})([.)])([ \t]+)(.*)$/)
+    if (!match) return null
+    return {
+      line,
+      indent: match[1],
+      ordinal: Number(match[2]),
+      delimiter: match[3],
+      token: `${match[2]}${match[3]}`,
+      spacing: match[4],
+      body: match[5]
+    }
+  }
+  const nearestNonBlank = (lines, index, step) => {
+    for (let cursor = index + step; cursor >= 0 && cursor < lines.length; cursor += step) {
+      if (lines[cursor].text.trim()) return cursor
+    }
+    return -1
+  }
+  const visibleBody = (value) => sourceVisibleIndex(String(value || '')).text.trim()
+  const change = commonChange(previous, next)
+
+  const previousLines = markdownLines(previous)
+  const before = []
+  for (let index = 0; index < previousLines.length; index += 1) {
+    const empty = rowMeta(previousLines[index])
+    if (!empty || empty.body.trim()) continue
+    const leftIndex = nearestNonBlank(previousLines, index, -1)
+    const rightIndex = nearestNonBlank(previousLines, index, 1)
+    if (leftIndex < 0 || rightIndex < 0) continue
+    const left = rowMeta(previousLines[leftIndex])
+    const right = rowMeta(previousLines[rightIndex])
+    if (
+      !left || !right || !left.body.trim() || !right.body.trim() ||
+      left.indent !== empty.indent || right.indent !== empty.indent ||
+      left.delimiter !== empty.delimiter || right.delimiter !== empty.delimiter ||
+      empty.ordinal !== left.ordinal + 1 || right.ordinal !== empty.ordinal + 1
+    ) continue
+    if (empty.line.end < change.start - 2 || empty.line.start > change.previousEnd + 2) continue
+    before.push({ left, empty, right })
+  }
+  if (before.length !== 1) return null
+  const target = before[0]
+
+  const nextLines = markdownLines(next)
+  const after = []
+  for (let index = 0; index < nextLines.length; index += 1) {
+    if (!/^[ \t]*<br\s*\/?>[ \t]*$/i.test(nextLines[index].text)) continue
+    const leftIndex = nearestNonBlank(nextLines, index, -1)
+    const rightIndex = nearestNonBlank(nextLines, index, 1)
+    if (leftIndex < 0 || rightIndex < 0) continue
+    const left = rowMeta(nextLines[leftIndex])
+    const right = rowMeta(nextLines[rightIndex])
+    if (
+      !left || !right ||
+      left.indent !== target.left.indent || right.indent !== target.right.indent ||
+      left.delimiter !== target.left.delimiter || right.delimiter !== target.right.delimiter ||
+      left.ordinal !== target.left.ordinal || right.ordinal !== target.empty.ordinal ||
+      visibleBody(left.body) !== visibleBody(target.left.body) ||
+      visibleBody(right.body) !== visibleBody(target.right.body)
+    ) continue
+    const line = nextLines[index]
+    if (line.end < change.start - 2 || line.start > change.nextEnd + 2) continue
+    after.push({ left, transient: line, right })
+  }
+  if (after.length !== 1) return null
+  const afterTarget = after[0]
+
+  const sourceLines = markdownLines(source)
+  const sourceMatches = []
+  for (let index = 0; index < sourceLines.length; index += 1) {
+    const empty = rowMeta(sourceLines[index])
+    if (!empty || empty.body.trim()) continue
+    const leftIndex = nearestNonBlank(sourceLines, index, -1)
+    const rightIndex = nearestNonBlank(sourceLines, index, 1)
+    if (leftIndex < 0 || rightIndex < 0) continue
+    const left = rowMeta(sourceLines[leftIndex])
+    const right = rowMeta(sourceLines[rightIndex])
+    if (
+      !left || !right || !left.body.trim() || !right.body.trim() ||
+      left.indent !== empty.indent || right.indent !== empty.indent ||
+      left.delimiter !== empty.delimiter || right.delimiter !== empty.delimiter ||
+      left.ordinal !== target.left.ordinal || empty.ordinal !== target.empty.ordinal || right.ordinal !== target.right.ordinal ||
+      visibleBody(left.body) !== visibleBody(target.left.body) ||
+      visibleBody(right.body) !== visibleBody(target.right.body)
+    ) continue
+    sourceMatches.push({ left, empty, right })
+  }
+  if (sourceMatches.length !== 1) return null
+  const sourceTarget = sourceMatches[0]
+
+  const rightTokenStart = sourceTarget.right.line.start + sourceTarget.right.indent.length
+  const rightTokenEnd = rightTokenStart + sourceTarget.right.token.length
+  const markdown = source.slice(0, sourceTarget.empty.line.start) +
+    source.slice(sourceTarget.right.line.start, rightTokenStart) +
+    `${afterTarget.right.ordinal}${sourceTarget.right.delimiter}` +
+    source.slice(rightTokenEnd)
+  return {
+    markdown,
+    preserved: true,
+    reason: 'diverged-empty-ordered-backspace-lift',
+    nextBaseline: next
+  }
+}
+
+// Multi-successor ordered Backspace is physically a merge followed by one
+// relabel Step for every successor. The transaction owner supplies the exact
+// removed index/list order/successor count; this raw mapper only proves that the
+// bounded authored rows match that PM family, then deletes the empty row and
+// rewrites successor ORDINAL DIGITS in place. Delimiters, spacing, bodies and
+// every unowned byte remain authored source.
+export const preserveOrderedEmptyBackspaceSuccessorChain = ({
+  source,
+  previous,
+  next,
+  removedIndex,
+  listOrder,
+  successorCount
+}) => {
+  if (
+    !Number.isInteger(removedIndex) || removedIndex < 1 ||
+    !Number.isInteger(listOrder) || listOrder < 0 ||
+    !Number.isInteger(successorCount) || successorCount < 2
+  ) return null
+
+  const rowMeta = (line) => {
+    const text = line.text.endsWith('\r') ? line.text.slice(0, -1) : line.text
+    const match = text.match(/^([ \t]*)(\d{1,9})([.)])([ \t]+)(.*)$/)
+    if (!match) return null
+    return Object.freeze({
+      line,
+      indent: match[1],
+      ordinal: Number(match[2]),
+      ordinalText: match[2],
+      delimiter: match[3],
+      spacing: match[4],
+      body: match[5]
+    })
+  }
+  const topRows = (markdown) => markdownLines(markdown)
+    .map(rowMeta)
+    .filter((row) => row && row.indent.length === 0)
+  const visibleBody = (value) => sourceVisibleIndex(String(value || '')).text.trim()
+  const previousRows = topRows(previous)
+  const nextRows = topRows(next)
+  const sourceRows = topRows(source)
+  const oldCount = previousRows.length
+  if (
+    oldCount < 4 ||
+    removedIndex >= oldCount - 1 ||
+    successorCount !== oldCount - removedIndex - 1 ||
+    nextRows.length !== oldCount - 1 ||
+    sourceRows.length !== oldCount
+  ) return null
+
+  const sourceDelimiters = new Set(sourceRows.map((row) => row.delimiter))
+  if (sourceDelimiters.size !== 1) return null
+  for (let index = 0; index < oldCount; index += 1) {
+    const previousRow = previousRows[index]
+    const sourceRow = sourceRows[index]
+    const expectedOrdinal = listOrder + index
+    if (
+      previousRow.ordinal !== expectedOrdinal ||
+      sourceRow.ordinal !== expectedOrdinal ||
+      previousRow.delimiter !== previousRows[0].delimiter ||
+      sourceRow.indent !== '' ||
+      visibleBody(sourceRow.body) !== visibleBody(previousRow.body)
+    ) return null
+    const previousEmpty = visibleBody(previousRow.body) === ''
+    const sourceEmpty = visibleBody(sourceRow.body) === ''
+    if (index === removedIndex) {
+      if (!previousEmpty || !sourceEmpty) return null
+    } else if (previousEmpty || sourceEmpty) {
+      return null
+    }
+  }
+
+  for (let nextIndex = 0; nextIndex < nextRows.length; nextIndex += 1) {
+    const sourceOldIndex = nextIndex < removedIndex ? nextIndex : nextIndex + 1
+    const previousRow = previousRows[sourceOldIndex]
+    const nextRow = nextRows[nextIndex]
+    if (
+      nextRow.ordinal !== listOrder + nextIndex ||
+      nextRow.delimiter !== nextRows[0].delimiter ||
+      visibleBody(nextRow.body) !== visibleBody(previousRow.body)
+    ) return null
+  }
+
+  const patches = []
+  for (let offset = 0; offset < successorCount; offset += 1) {
+    const oldIndex = removedIndex + 1 + offset
+    const row = sourceRows[oldIndex]
+    const ordinalStart = row.line.start + row.indent.length
+    patches.push(Object.freeze({
+      start: ordinalStart,
+      end: ordinalStart + row.ordinalText.length,
+      replacement: String(row.ordinal - 1)
+    }))
+  }
+  patches.push(Object.freeze({
+    start: sourceRows[removedIndex].line.start,
+    end: sourceRows[removedIndex + 1].line.start,
+    replacement: ''
+  }))
+  patches.sort((left, right) => right.start - left.start)
+  let markdown = source
+  for (const patch of patches) {
+    markdown = markdown.slice(0, patch.start) + patch.replacement + markdown.slice(patch.end)
+  }
+  return Object.freeze({
+    markdown,
+    preserved: true,
+    reason: 'diverged-empty-ordered-backspace-successor-chain',
+    nextBaseline: next,
+    removedIndex,
+    successorCount
+  })
+}
+
+export const preserveTransactionOwnedOrderedEmptySuccessorChain = ({
+  source,
+  previous,
+  next,
+  removedIndex,
+  listOrder,
+  successorCount
+}) => {
+  const rawSource = String(source || '')
+  const rawPrevious = String(previous || '')
+  const rawNext = String(next || '')
+  if (!rawPrevious || !rawNext || rawPrevious === rawNext) return null
+  const sourceEndings = new Set(rawSource.match(/\r\n|\r|\n/g) || [])
+  if (sourceEndings.size > 1) return null
+  const sourceEol = sourceEndings.values().next().value || '\n'
+  const normalize = (value) => String(value || '').replace(/\r\n|\r/g, '\n')
+  const restore = (value) => sourceEol === '\n'
+    ? String(value || '')
+    : String(value || '').replace(/\n/g, sourceEol)
+  const normalizedSource = normalize(rawSource)
+  const comparablePrevious = normalizeOrderedListDelimiters(
+    normalizeEmptyListItems(normalize(rawPrevious))
+  )
+  const comparableNext = normalizeOrderedListDelimiters(
+    normalizeEmptyListItems(normalize(rawNext))
+  )
+  const result = preserveOrderedEmptyBackspaceSuccessorChain({
+    source: normalizedSource,
+    previous: comparablePrevious,
+    next: comparableNext,
+    removedIndex,
+    listOrder,
+    successorCount
+  })
+  if (!result || result.preserved === false || typeof result.markdown !== 'string') return null
+  const normalizedMapped = normalize(result.markdown)
+  const contentLineCount = (value) => {
+    const withoutTerminal = String(value || '').replace(/\n+$/, '')
+    return withoutTerminal ? withoutTerminal.split('\n').length : 0
+  }
+  const trailingBoundaryNewlineGrowth = Boolean(
+    /\n$/.test(normalizedMapped) &&
+    contentLineCount(normalizedMapped) > contentLineCount(normalizedSource)
+  ) ? 1 : 0
+  return Object.freeze({
+    ...result,
+    markdown: restore(result.markdown),
+    trailingBoundaryNewlineGrowth,
+    nextBaseline: rawNext
+  })
+}
+
+// RS-72 has its own transaction family. Once its two-Step journal is proven,
+// only the single-empty ordered Backspace mapper is allowed to interpret the
+// bounded source fragment. Do not run the generic list mapper chain here: a
+// focused owner rejection must stay a rejection rather than finding another
+// list-shaped explanation inside the same callback.
+export const preserveTransactionOwnedSingleEmptyOrderedBackspaceLift = ({
+  source,
+  previous,
+  next
+}) => {
+  const rawSource = String(source || '')
+  const rawPrevious = String(previous || '')
+  const rawNext = String(next || '')
+  if (!rawPrevious || !rawNext || rawPrevious === rawNext) return null
+
+  const sourceEndings = new Set(rawSource.match(/\r\n|\r|\n/g) || [])
+  if (sourceEndings.size > 1) return null
+  const sourceEol = sourceEndings.values().next().value || '\n'
+  const normalize = (value) => String(value || '').replace(/\r\n|\r/g, '\n')
+  const restore = (value) => sourceEol === '\n'
+    ? String(value || '')
+    : String(value || '').replace(/\n/g, sourceEol)
+  const normalizedSource = normalize(rawSource)
+  const comparablePrevious = normalizeOrderedListDelimiters(
+    normalizeEmptyListItems(normalize(rawPrevious))
+  )
+  const comparableNext = normalizeOrderedListDelimiters(
+    normalizeEmptyListItems(normalize(rawNext))
+  )
+  const result = preserveSingleEmptyOrderedBackspaceLift({
+    source: normalizedSource,
+    previous: comparablePrevious,
+    next: comparableNext
+  })
+  if (!result || result.preserved === false || typeof result.markdown !== 'string') return null
+
+  const normalizedMapped = normalize(result.markdown)
+  const contentLineCount = (value) => {
+    const withoutTerminal = String(value || '').replace(/\n+$/, '')
+    return withoutTerminal ? withoutTerminal.split('\n').length : 0
+  }
+  const trailingBoundaryNewlineGrowth = Boolean(
+    /\n$/.test(normalizedMapped) &&
+    contentLineCount(normalizedMapped) > contentLineCount(normalizedSource)
+  ) ? 1 : 0
+  return {
+    ...result,
+    markdown: restore(result.markdown),
+    trailingBoundaryNewlineGrowth,
+    nextBaseline: rawNext
+  }
+}
+
+// A transaction owner has already proven the exact old/new top-level list
+// subtree and sliced away every neighbouring block. Reuse the established list
+// delta implementations on that bounded region instead of asking a
+// whole-document visible diff to rediscover the target. This function does not
+// grant publication authority; the caller must still splice the result into the
+// complete source and pass normal semantic/list-slot validation.
+export const preserveTransactionOwnedListSubtreeChange = ({
+  source,
+  previous,
+  next,
+  siblingParagraphJoin = null
+}) => {
+  const rawSource = String(source || '')
+  const rawPrevious = String(previous || '')
+  const rawNext = String(next || '')
+  if (!rawPrevious || !rawNext || rawPrevious === rawNext) return null
+
+  // The list algorithms use logical-line coordinates. A transaction-owned
+  // range is already isolated from neighbouring bytes, so normalize its three
+  // representations to LF, run the existing mapper once, then replay only the
+  // mapped fragment with the authored source's uniform EOL. Mixed-EOL list
+  // subtrees remain ambiguous and deliberately defer to the legacy path.
+  const sourceEndings = new Set(rawSource.match(/\r\n|\r|\n/g) || [])
+  if (sourceEndings.size > 1) return null
+  const sourceEol = sourceEndings.values().next().value || '\n'
+  const normalize = (value) => String(value || '').replace(/\r\n|\r/g, '\n')
+  const restore = (value) => sourceEol === '\n'
+    ? String(value || '')
+    : String(value || '').replace(/\n/g, sourceEol)
+  const normalizedSource = normalize(rawSource)
+  const normalizedPrevious = normalize(rawPrevious)
+  const normalizedNext = normalize(rawNext)
+  // The legacy facade performs these source-safe canonical normalizations
+  // before dispatching list mappers. Transaction ownership changes lifecycle,
+  // not list syntax semantics: use the same comparable representation so an
+  // empty nested item persists as a parse-safe marker, never Crepe's `<br />`.
+  const comparablePrevious = normalizeOrderedListDelimiters(
+    normalizeEmptyListItems(normalizedPrevious)
+  )
+  const comparableNext = normalizeOrderedListDelimiters(
+    normalizeEmptyListItems(normalizedNext)
+  )
+  const change = commonChange(comparablePrevious, comparableNext)
+  const attempts = [
+    () => preserveSingleEmptyOrderedBackspaceLift({
+      source: normalizedSource,
+      previous: comparablePrevious,
+      next: comparableNext
+    }),
+    () => preserveStableListRowChanges({
+      source: normalizedSource,
+      previous: comparablePrevious,
+      next: comparableNext
+    }),
+    () => preserveDivergedNestedListChange({
+      source: normalizedSource,
+      previous: comparablePrevious,
+      next: comparableNext,
+      ...change
+    }),
+    () => preserveListBlockChange({
+      source: normalizedSource,
+      previous: comparablePrevious,
+      next: comparableNext,
+      ...change
+    }),
+    () => preserveBatchedListBlockChanges({
+      source: normalizedSource,
+      previous: comparablePrevious,
+      next: comparableNext
+    })
+  ]
+  const repairProvenSiblingParagraphJoin = (mapped) => {
+    if (
+      siblingParagraphJoin?.kind !== 'transaction-list-sibling-item-paragraph-join-proof' ||
+      siblingParagraphJoin?.listType !== 'bullet_list' ||
+      mapped?.reason !== 'diverged-nested-list-change'
+    ) return null
+
+    const sourceLines = normalizedSource.split('\n')
+    const previousLines = comparablePrevious.split('\n')
+    const nextLines = comparableNext.split('\n')
+    const mappedLines = normalize(mapped.markdown).split('\n')
+    if (
+      sourceLines.length !== 2 ||
+      previousLines.length !== 3 ||
+      nextLines.length !== 3 ||
+      mappedLines.length !== 2 ||
+      previousLines[1].trim() !== '' ||
+      nextLines[1].trim() !== ''
+    ) return null
+
+    const sourceFirst = sourceLines[0].match(/^([-+*])([ \t]+)(.+)$/)
+    const sourceSecond = sourceLines[1].match(/^([-+*])([ \t]+)(.+)$/)
+    const previousFirst = previousLines[0].match(/^([-+*])([ \t]+)(.+)$/)
+    const previousSecond = previousLines[2].match(/^([-+*])([ \t]+)(.+)$/)
+    const nextFirst = nextLines[0].match(/^([-+*])([ \t]+)(.+)$/)
+    const nextContinuation = nextLines[2].match(/^([ \t]+)(.+)$/)
+    const mappedContinuation = mappedLines[1].match(/^([ \t]+)(.+)$/)
+    if (
+      !sourceFirst || !sourceSecond || !previousFirst || !previousSecond ||
+      !nextFirst || !nextContinuation || !mappedContinuation ||
+      /^[-+*](?:[ \t]|$)/.test(nextLines[2]) ||
+      mappedLines[0] !== sourceLines[0] ||
+      mappedContinuation[2] !== sourceSecond[3] ||
+      mappedContinuation[1] !== nextContinuation[1]
+    ) return null
+
+    return Object.freeze({
+      ...mapped,
+      markdown: `${mappedLines[0]}\n\n${mappedLines[1]}`,
+      reason: 'diverged-sibling-list-item-paragraph-join'
+    })
+  }
+
+  const contentLineCount = (value) => {
+    const withoutTerminal = String(value || '').replace(/\n+$/, '')
+    return withoutTerminal ? withoutTerminal.split('\n').length : 0
+  }
+  for (const attempt of attempts) {
+    const result = attempt()
+    if (result && result.preserved !== false && typeof result.markdown === 'string') {
+      const repaired = repairProvenSiblingParagraphJoin(result) || result
+      const normalizedMapped = normalize(repaired.markdown)
+      // The source range ends at the final list-row byte; the untouched source
+      // suffix owns the pre-existing separator before the next top-level block.
+      // When the mapper appends one or more NEW rows at the subtree tail, its
+      // final EOL is the terminator of that new authored row and must precede
+      // the old separator. Deletion and same-row edits reuse the suffix's first
+      // EOL and therefore declare no growth. This is a structural line-count
+      // contract, independent of list text, marker spelling or neighbour type.
+      const trailingBoundaryNewlineGrowth = Boolean(
+        /\n$/.test(normalizedMapped) &&
+        contentLineCount(normalizedMapped) > contentLineCount(normalizedSource)
+      ) ? 1 : 0
+      return {
+        ...repaired,
+        markdown: restore(repaired.markdown),
+        trailingBoundaryNewlineGrowth,
+        // The owner supplied the entire final list subtree, so a successful
+        // bounded map consumes that complete local baseline.
+        nextBaseline: rawNext
+      }
+    }
+  }
+  return null
 }
 
 const listStructure = (markdown, block) => {
